@@ -52,17 +52,13 @@ since the last run, or the user asked for it.
   `<=`, exact values for arithmetic, each side of `and` and `or`.
 - A mutant no input can tell apart (equivalent), or one in unreachable code:
   report it with file and line. Remove dead code only while tests stay green.
-- **Python multi-line conditions:** coverage.py records only a statement's
-  first line, so a site on a continuation line shows UNCOVERED even when the
-  test runs it.
-
-  ```python
-  if (order.total >= 500
-          and order.customer.is_member):   # 'and' shows UNCOVERED
-  ```
-
-  Fix the code, not the tests: join the condition onto one line or extract a
-  named predicate (`if qualifies(order):`). Then rerun the file.
+- **Multi-line statements:** a site counts as covered when the coverage
+  report hits either its own line or the statement's start line. Do not
+  rewrite a condition merely to put its operators on one line. If a site
+  still shows UNCOVERED, inspect fresh coverage and its statement anchor.
+- **TypeScript types:** literals and operators inside type annotations,
+  aliases, interfaces, and type arguments/parameters are not runtime mutation
+  sites. Missing type-only sites are intentional, not a coverage gap.
 
 ## `.metrics/mutate/` is the next run's input
 
@@ -78,7 +74,8 @@ also rewrites `:tested-at` in every snapshot, which is expected churn.
 
 - Typing `--mutate-all` without a deleted or weakened test.
 - Deleting `.metrics/` "so the tree is tidy".
-- Adding tests for an UNCOVERED site on a continuation line.
+- Rewriting multi-line statements solely to work around the old coverage
+  behavior, or treating skipped TypeScript type-only sites as untested code.
 
 ## More
 

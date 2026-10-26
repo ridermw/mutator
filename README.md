@@ -4,7 +4,7 @@ Mutation testing for Clojure, Java, Go, TypeScript, Rust, and Python. One run de
 
 Clojure follows [clj-mutate](https://github.com/unclebob/clj-mutate). Go follows [mutate4go](https://github.com/unclebob/mutate4go). Java follows [mutate4java](https://github.com/unclebob/mutate4java). TypeScript, Rust, and Python use the same decisions as Java, spelled in that language. Function names and namespaces come from [crapper](https://github.com/unclebob/crapper), which is what uml-viewer joins to `.metrics/crap.edn`.
 
-A mutant is killed when the tests fail or time out. It survives when the tests still pass. A site on a line the coverage report does not hit is uncovered and is not run. The score uml-viewer paints is killed / (killed + survived).
+A mutant is killed when the tests fail or time out. It survives when the tests still pass. A site is covered when the report hits its own line or the start line of its enclosing statement, so operators on continuation lines can run even when LCOV records only the statement start. Otherwise it is uncovered and is not run. The score uml-viewer paints is killed / (killed + survived).
 
 ## Run
 
@@ -89,6 +89,10 @@ uml-viewer loads every `*.edn` file under `.metrics/mutate`. Each file is one na
 ## What each language mutates
 
 Tokens inside strings, comments, and quoted Clojure forms are left alone. A replacement that does not compile fails the test run and counts as killed.
+
+TypeScript type annotations, aliases, interfaces, type arguments/parameters,
+and literal types are also left alone: they describe types, not runtime
+behavior.
 
 | Language | Mutations |
 | --- | --- |
