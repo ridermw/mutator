@@ -325,6 +325,91 @@ def test_mutator_round2_fixes_dynamic_output_lines_incomplete_same_line_privacy_
     assert load_history(cs_ov, "src/C.cs").classifier_versions == {}
 
 
+def test_mutator_round3_fixes_importer_tracked_output_compile_import_custom_cmd_and_ps_export(tmp_path):
+    import subprocess
+    from mutator.functions import is_private
+
+    # 1. Importer expansion must copy tracked output dir, never symlink mutable output dir
+    js_root = tmp_path / "jsimp"
+    _write(js_root, "src/mod.mjs", "export function add(a, b) { return a + b; }\n")
+    _write(js_root, "tests/use.mjs", "import { add } from '../src/mod.mjs';\nexport const x = add(1, 2);\n")
+    _write(js_root, "tests/build/gen.txt", "tracked\n")
+    _write(js_root, "tests/build/untracked.out", "original\n")
+    subprocess.run(["git", "init", "-q"], cwd=js_root, check=True)
+    subprocess.run(["git", "add", "src/mod.mjs", "tests/use.mjs", "tests/build/gen.txt"], cwd=js_root, check=True)
+    b_js = new_run_dir(js_root)
+    try:
+        workers = create_workers(b_js, js_root, "src/mod.mjs", (js_root / "src/mod.mjs").read_bytes(), 1)
+        w_build = workers[0] / "tests/build"
+        assert w_build.is_dir() and not w_build.is_symlink()
+        assert (w_build / "gen.txt").read_text() == "tracked\n"
+        assert not (w_build / "untracked.out").exists()
+    finally:
+        delete_tree(b_js)
+
+    # 2. Explicit absolute <Compile Include> is rejected
+    p_comp = tmp_path / "abscomp"
+    s_comp = _write(p_comp, "src/C.cs", "class C { int F(int x) => x + 1; }\n")
+    _write(
+        p_comp,
+        "App.csproj",
+        f'<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><Compile Include="{s_comp.resolve()}" /></ItemGroup></Project>\n',
+    )
+    b1 = new_run_dir(p_comp)
+    try:
+        with pytest.raises(ValueError, match="Absolute MSBuild Compile Include"):
+            create_workers(b1, p_comp, "src/C.cs", s_comp.read_bytes(), 1)
+    finally:
+        delete_tree(b1)
+
+    # 3. Escaping <Import Project> and imported file with escaping <OutputPath> are both rejected
+    p_imp = tmp_path / "escimp"
+    s_imp = _write(p_imp, "src/C.cs", "class C { int F(int x) => x + 1; }\n")
+    _write(p_imp, "shared/bad.xml", "<Project><PropertyGroup><OutputPath>/tmp/shared_out</OutputPath></PropertyGroup></Project>\n")
+    _write(p_imp, "App.csproj", '<Project Sdk="Microsoft.NET.Sdk"><Import Project="shared/bad.xml" /></Project>\n')
+    b2 = new_run_dir(p_imp)
+    try:
+        with pytest.raises(ValueError, match="Absolute C# output path"):
+            create_workers(b2, p_imp, "src/C.cs", s_imp.read_bytes(), 1)
+    finally:
+        delete_tree(b2)
+
+    # 4. Custom --test-command on C# discards prior phased-runner kills instead of skipping execution
+    cs_cached = tmp_path / "cscached"
+    cs_src = "namespace Demo;\npublic class C { public int F(int x) => x + 1; }\n"
+    cs_p = _write(cs_cached, "src/C.cs", cs_src)
+    cs_sites = sites_in_file(cs_src, cs_p, cs_cached, "src/C.cs")
+    cs_forms = _forms(
+        cs_src, cs_p, cs_cached, "src/C.cs", cs_sites,
+        {s.mutation_id: True for s in cs_sites},
+        {s.mutation_id: "killed" for s in cs_sites},
+        None,
+    )
+    write_results(
+        cs_cached, "src/C.cs", cs_forms, {s.mutation_id: "killed" for s in cs_sites},
+        classifier_version=CLASSIFIER_VERSION,
+    )
+    ran = []
+
+    class RecordingRunner:
+        verbose = False
+
+        def run(self, command, cwd, timeout):
+            ran.append(command)
+            return CommandResult(code=0, timed_out=False, seconds=0.01, output="")
+
+    mutate_file(
+        cs_p, cs_cached, runner=RecordingRunner(), covered_lines=None, ignore_coverage=True,
+        mutate_all=False, lines=None, test_command="custom-cmd", timeout_factor=10,
+        mutation_warning=50, baselines={}, max_workers=1,
+    )
+    assert len(ran) > 0
+
+    # 5. Export-ModuleMember -Function stops at next parameter (-Alias)
+    ps_src = "function Get-Public { return 1 }\nExport-ModuleMember -Function Get-Public -Alias gp\n"
+    assert not is_private("powershell", "Get-Public", ps_src, 1, 1)
+
+
 @pytest.mark.skipif(not shutil.which("pwsh"), reason="pwsh not installed")
 def test_powershell_live_mutation_isolated_worker(tmp_path):
     src_text = """\

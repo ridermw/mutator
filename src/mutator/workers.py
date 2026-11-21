@@ -297,7 +297,13 @@ def importers_of(root: Path, relative: str) -> set[str]:
     return {path.relative_to(root_resolved).as_posix() for path in found}
 
 
-def _expand_directory(link: Path, real_dir: Path, root: Path, tracked: frozenset[str]) -> None:
+def _expand_directory(
+    link: Path,
+    real_dir: Path,
+    root: Path,
+    tracked: frozenset[str],
+    tracked_all: frozenset[str] = frozenset(),
+) -> None:
     """Replace a linked directory so a copied module is not written through it."""
 
     if not real_dir.is_dir():
@@ -307,17 +313,26 @@ def _expand_directory(link: Path, real_dir: Path, root: Path, tracked: frozenset
     for child in real_dir.iterdir():
         if _skipped(child, root, tracked):
             continue
+        if child.is_dir() and child.name in OUTPUT_DIRS and tracked_all:
+            _copy_tracked_output_dir(link, child, root, tracked_all)
+            continue
         symlink(link / child.name, child)
 
 
-def _copy_importer(worker: Path, root: Path, relative: str, tracked: frozenset[str]) -> None:
+def _copy_importer(
+    worker: Path,
+    root: Path,
+    relative: str,
+    tracked: frozenset[str],
+    tracked_all: frozenset[str] = frozenset(),
+) -> None:
     real = root
     current = worker
     for segment in relative.split("/")[:-1]:
         real = real / segment
         current = current / segment
         if current.is_symlink():
-            _expand_directory(current, real, root, tracked)
+            _expand_directory(current, real, root, tracked, tracked_all)
         elif not current.exists():
             current.mkdir(parents=True)
     destination = worker / relative
@@ -349,11 +364,57 @@ def _overlay(
     destination.write_bytes(original)
 
 
-def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
+def _validate_msbuild_path(
+    raw: str, owner: Path, root_resolved: Path, label: str
+) -> list[Path]:
+    from pathlib import PureWindowsPath
+
+    resolved: list[Path] = []
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if any(tok in entry for tok in ("$(", "@(", "%(")):
+            raise ValueError(
+                f"Dynamic MSBuild {label} {entry!r} in {owner} cannot be verified for worker isolation"
+            )
+        norm = entry.replace("\\", "/")
+        if Path(norm).is_absolute() or PureWindowsPath(entry).is_absolute():
+            raise ValueError(
+                f"Absolute MSBuild {label} {entry!r} in {owner} would reference the original tree"
+            )
+        if "*" in norm or "?" in norm:
+            prefix = norm.split("*", 1)[0].split("?", 1)[0]
+            base = (owner.parent / (prefix or ".")).resolve()
+            if not base.is_relative_to(root_resolved):
+                raise ValueError(f"MSBuild {label} {entry!r} in {owner} escapes --root")
+        else:
+            target = (owner.parent / norm).resolve()
+            if not target.is_relative_to(root_resolved):
+                raise ValueError(f"MSBuild {label} {entry!r} in {owner} escapes --root")
+            resolved.append(target)
+    return resolved
+
+
+def _validate_csharp_file(
+    path: Path,
+    root_resolved: Path,
+    *,
+    visited: set[Path] | None = None,
+    force_xml: bool = False,
+) -> None:
     """Validate bounded C# solution/project closure before copying or building."""
 
+    if visited is None:
+        visited = set()
+    real_path = path.resolve()
+    if real_path in visited:
+        return
+    visited.add(real_path)
+
     references: list[str] = []
-    if path.suffix.lower() == ".sln":
+    imported_files: list[Path] = []
+    if not force_xml and path.suffix.lower() == ".sln":
         text = path.read_text(encoding="utf-8-sig", errors="replace")
         for match in re.findall(
             r'Project\("[^"\n]+"\)\s*=\s*"[^"\n]*",\s*"([^"\n]+\.(?:csproj|fsproj|vbproj))"',
@@ -361,7 +422,7 @@ def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
             re.IGNORECASE,
         ):
             references.append(match)
-    elif path.suffix.lower() in {".csproj", ".props", ".targets", ".slnx"}:
+    elif force_xml or path.suffix.lower() in {".csproj", ".props", ".targets", ".slnx"}:
         try:
             xml_root = ET.parse(path).getroot()
         except ET.ParseError as exc:
@@ -372,6 +433,17 @@ def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
                 ref = item.get("Include")
                 if ref is not None:
                     references.append(ref)
+            elif tag == "Compile":
+                inc = item.get("Include")
+                if inc is not None:
+                    _validate_msbuild_path(inc, path, root_resolved, "Compile Include")
+            elif tag == "Import":
+                proj_ref = item.get("Project")
+                if proj_ref is not None:
+                    targets = _validate_msbuild_path(proj_ref, path, root_resolved, "MSBuild Import")
+                    for target in targets:
+                        if target.is_file():
+                            imported_files.append(target)
             elif path.suffix.lower() == ".slnx" and tag == "Project":
                 ref = item.get("Path")
                 if ref is not None:
@@ -396,6 +468,8 @@ def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
                             f"C# output path {raw_val!r} in {path} escapes --root; "
                             "worker isolation requires root-contained outputs"
                         )
+    for imported in imported_files:
+        _validate_csharp_file(imported, root_resolved, visited=visited, force_xml=True)
     for ref in references:
         from pathlib import PureWindowsPath
 
@@ -473,7 +547,7 @@ def create_workers(
             _link_children(worker, root, {first}, root, tracked, tracked_all)
             _overlay(worker, root, relative, original, tracked, tracked_all)
             for importer in importers:
-                _copy_importer(worker, root, importer, tracked)
+                _copy_importer(worker, root, importer, tracked, tracked_all)
         created.append(worker)
     return created
 

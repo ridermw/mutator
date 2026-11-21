@@ -12,9 +12,28 @@ from mutator.model import Site
 from mutator.sites import discover_raw
 
 _PS_EXPORT_RE = re.compile(
-    r"Export-ModuleMember\b[^\n]*?-Function\s+([^\r\n;#|]+)",
+    r"Export-ModuleMember\b[^\r\n;#|]*?-Function\s+([^\r\n;#|]+)",
     re.IGNORECASE,
 )
+
+
+def _powershell_static_exports(source: str) -> set[str] | None:
+    """Static Export-ModuleMember -Function names (lowercased), or None if absent/dynamic."""
+
+    matches = _PS_EXPORT_RE.findall(source)
+    if not matches:
+        return None
+    exported: set[str] = set()
+    for expr in matches:
+        # Stop before the next cmdlet parameter (e.g. `-Alias`, `-Variable`, `-Cmdlet`).
+        expr = re.split(r"\s+-[A-Za-z]", expr, maxsplit=1)[0]
+        if "$" in expr or "*" in expr:
+            return None
+        for item in expr.strip().lstrip("@(").rstrip(")").split(","):
+            cleaned = item.strip().strip("'\"")
+            if cleaned:
+                exported.add(cleaned.lower())
+    return exported or None
 
 
 def _lines(source: str) -> list[str]:
@@ -49,23 +68,6 @@ def _python_private(name: str) -> bool:
 
 def _typescript_private(name: str, header: str) -> bool:
     return name.startswith("#") or bool(re.search(r"\bprivate\b", header))
-
-
-def _powershell_static_exports(source: str) -> set[str] | None:
-    """Static Export-ModuleMember -Function names (lowercased), or None if absent/dynamic."""
-
-    matches = _PS_EXPORT_RE.findall(source)
-    if not matches:
-        return None
-    exported: set[str] = set()
-    for expr in matches:
-        if "$" in expr or "*" in expr:
-            return None
-        for item in expr.strip().lstrip("@(").rstrip(")").split(","):
-            cleaned = item.strip().strip("'\"")
-            if cleaned:
-                exported.add(cleaned.lower())
-    return exported or None
 
 
 def _declaration_prefix(

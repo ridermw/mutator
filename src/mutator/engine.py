@@ -399,8 +399,15 @@ def mutate_file(
     if language in _VERSIONED_LANGUAGES:
         for ns, fid, _s, _e, _nm, _pr, dg, ordinal in form_declarations(source, path, root):
             digests[(ns, fid, ordinal)] = dg
-    selected = _select(found, covered, history, digests, mutate_all, lines, language=language)
-    outcomes = _carry_forward(found, covered, history, digests, language=language)
+    bypass_cache = bool(test_command and language in _VERSIONED_LANGUAGES)
+    selected = _select(
+        found, covered, history, digests, mutate_all or bypass_cache, lines, language=language
+    )
+    outcomes = (
+        {}
+        if bypass_cache
+        else _carry_forward(found, covered, history, digests, language=language)
+    )
     _warn_many(file_key, selected, mutation_warning)
     failure = _apply_selected(
         path,
