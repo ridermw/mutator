@@ -55,6 +55,10 @@ def _forms_of(data: dict) -> list[dict]:
     return [form for form in forms if isinstance(form, dict)]
 
 
+_RECORDABLE_OUTCOMES = {"killed", "survived", "invalid", "error"}
+CLASSIFIER_VERSION = 2
+
+
 def _outcomes_of(data: dict) -> dict[str, str]:
     raw = data.get("outcomes")
     if not isinstance(raw, dict):
@@ -64,7 +68,7 @@ def _outcomes_of(data: dict) -> dict[str, str]:
         if not isinstance(key, str):
             continue
         status = value[1:] if isinstance(value, str) and value.startswith(":") else value
-        if status in {"killed", "survived"}:
+        if status in _RECORDABLE_OUTCOMES:
             found[key] = status
     return found
 
@@ -84,12 +88,18 @@ def _remember_form(history: History, namespace: str, form: dict, data: dict, fil
     digest = form.get("hash")
     if not isinstance(form_id, str) or not isinstance(digest, str):
         return
-    history.forms[(namespace, form_id)] = PriorForm(
+    ordinal = form.get("ordinal")
+    prior = PriorForm(
         namespace=namespace,
         id=form_id,
         digest=digest,
         file=file_key,
+        line=int(form.get("line") or 0),
+        ordinal=ordinal if isinstance(ordinal, int) else None,
     )
+    history.forms[(namespace, form_id)] = prior
+    if isinstance(ordinal, int):
+        history.declaration_forms[(namespace, form_id, ordinal)] = prior
 
 
 def _remember_forms(history: History, data: dict, namespace: str, file_key: str) -> None:
@@ -103,8 +113,19 @@ def _remember_outcomes(history: History, data: dict, file_key: str) -> None:
             history.outcomes[mutation] = status
 
 
+def _file_classifier_version(data: dict, file_key: str) -> int | None:
+    by_file = data.get("classifier-versions")
+    if isinstance(by_file, dict):
+        v = by_file.get(file_key)
+        if isinstance(v, int):
+            return v
+        return None
+    cv = data.get("classifier-version")
+    return cv if isinstance(cv, int) else None
+
+
 def load_history(root: Path, file_key: str) -> History:
-    """Prior form hashes and outcomes recorded for `file_key`."""
+    """Prior form hashes, outcomes, and classifier versions recorded for `file_key`."""
 
     history = History()
     for path in _edn_files(root):
@@ -114,13 +135,16 @@ def load_history(root: Path, file_key: str) -> History:
         namespace = data.get("namespace")
         if not isinstance(namespace, str):
             continue
+        cv = _file_classifier_version(data, file_key)
+        if cv is not None:
+            history.classifier_versions[namespace] = cv
         _remember_forms(history, data, namespace, file_key)
         _remember_outcomes(history, data, file_key)
     return history
 
 
 def _render_form(form: FormResult) -> dict:
-    return {
+    entry = {
         "id": form.id,
         "kind": "defn-" if form.private else "defn",
         "file": form.file,
@@ -132,10 +156,25 @@ def _render_form(form: FormResult) -> dict:
         "uncovered": form.uncovered,
         "sites": form.sites,
     }
+    if form.ordinal is not None:
+        entry["ordinal"] = form.ordinal
+    if form.invalid:
+        entry["invalid"] = form.invalid
+    if form.errors:
+        entry["errors"] = form.errors
+    if form.incomplete:
+        entry["incomplete"] = True
+    return entry
 
 
-def _render_snapshot(namespace: str, source: str, forms: list[dict], outcomes: dict[str, str]) -> str:
-    payload = {
+def _render_snapshot(
+    namespace: str,
+    source: str,
+    forms: list[dict],
+    outcomes: dict[str, str],
+    classifier_versions: dict[str, int] | None = None,
+) -> str:
+    payload: dict = {
         "version": 1,
         "tested-at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source": source,
@@ -143,6 +182,21 @@ def _render_snapshot(namespace: str, source: str, forms: list[dict], outcomes: d
         "outcomes": {key: keyword(outcomes[key]) for key in sorted(outcomes)},
         "forms": forms,
     }
+    if classifier_versions:
+        payload["classifier-versions"] = {
+            k: classifier_versions[k] for k in sorted(classifier_versions)
+        }
+        # Only set top-level classifier-version when every file present in the
+        # snapshot shares the same version (never stamping retained legacy files).
+        files_in_snap = {str(f.get("file")) for f in forms if f.get("file")} | {
+            mf for m in outcomes if (mf := mutation_file(m))
+        }
+        if files_in_snap and files_in_snap.issubset(classifier_versions):
+            vals = {classifier_versions[f] for f in files_in_snap}
+            if len(vals) == 1:
+                payload["classifier-version"] = next(iter(vals))
+    if any(form.get("incomplete") for form in forms):
+        payload["incomplete"] = True
     text = dumps(payload)
     # Keep the file readable. dumps is one line; break after the top-level pairs
     # is unnecessary because clojure.edn reads either shape.
@@ -173,7 +227,7 @@ def _file_outcomes(outcomes: dict[str, str], file_key: str) -> dict[str, str]:
     for mutation, status in outcomes.items():
         if mutation_file(mutation) != file_key:
             continue
-        if status not in {"killed", "survived"}:
+        if status not in _RECORDABLE_OUTCOMES:
             continue
         found[mutation] = status
     return found
@@ -195,19 +249,42 @@ def _mentions_file(data: dict, file_key: str) -> bool:
     return False
 
 
+def _kept_classifier_versions(data: dict, file_key: str) -> dict[str, int]:
+    kept: dict[str, int] = {}
+    by_file = data.get("classifier-versions")
+    if isinstance(by_file, dict):
+        for f, v in by_file.items():
+            if isinstance(f, str) and isinstance(v, int) and f != file_key:
+                kept[f] = v
+        return kept
+    cv = data.get("classifier-version")
+    if isinstance(cv, int):
+        for form in _kept_forms(data, file_key):
+            f = _form_file(form, data)
+            if f and f != file_key:
+                kept[f] = cv
+        for m in _kept_outcomes(data, file_key):
+            mf = mutation_file(m)
+            if mf and mf != file_key:
+                kept[mf] = cv
+    return kept
+
+
 def _keep(retained: dict, namespace: str, data: dict, file_key: str) -> None:
     kept_forms = _kept_forms(data, file_key)
     kept_outcomes = _kept_outcomes(data, file_key)
+    kept_versions = _kept_classifier_versions(data, file_key)
     if not kept_forms and not kept_outcomes:
         return
-    forms_so_far, outcomes_so_far = retained.get(namespace, ([], {}))
+    forms_so_far, outcomes_so_far, versions_so_far = retained.get(namespace, ([], {}, {}))
     forms_so_far.extend(kept_forms)
     outcomes_so_far.update(kept_outcomes)
-    retained[namespace] = (forms_so_far, outcomes_so_far)
+    versions_so_far.update(kept_versions)
+    retained[namespace] = (forms_so_far, outcomes_so_far, versions_so_far)
 
 
 def _retain(existing, file_key: str):
-    retained: dict[str, tuple[list[dict], dict[str, str]]] = {}
+    retained: dict[str, tuple[list[dict], dict[str, str], dict[str, int]]] = {}
     previous: set[str] = set()
     for _path, data in existing:
         namespace = data.get("namespace")
@@ -245,19 +322,31 @@ def _write_namespace(
     fresh: list[FormResult],
     outcomes: dict[str, str],
     file_key: str,
+    *,
+    kept_versions: dict[str, int] | None = None,
+    classifier_version: int | None = None,
 ) -> Path | None:
     rendered = _dedupe(kept_forms + [_render_form(form) for form in fresh])
     rendered.sort(key=_form_order)
     merged = dict(kept_outcomes)
     if fresh:
         merged.update(_outcomes_for(outcomes, namespace))
+    versions = dict(kept_versions or {})
+    if fresh and classifier_version is not None:
+        versions[file_key] = classifier_version
     path = snapshot_path(root, namespace)
     if not rendered and not merged:
         path.unlink(missing_ok=True)
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        _render_snapshot(namespace, _snapshot_source(fresh, kept_forms, file_key), rendered, merged),
+        _render_snapshot(
+            namespace,
+            _snapshot_source(fresh, kept_forms, file_key),
+            rendered,
+            merged,
+            classifier_versions=versions or None,
+        ),
         encoding="utf-8",
     )
     return path
@@ -281,7 +370,12 @@ def _drop_stale(existing, touched: set[str], canonical: set[Path], file_key: str
 
 
 def write_results(
-    root: Path, file_key: str, forms: list[FormResult], outcomes: dict[str, str]
+    root: Path,
+    file_key: str,
+    forms: list[FormResult],
+    outcomes: dict[str, str],
+    *,
+    classifier_version: int | None = None,
 ) -> list[Path]:
     """Replace this file's forms, preserving other files that share a namespace.
 
@@ -298,7 +392,7 @@ def write_results(
     touched = set(incoming) | previous | set(retained)
     written: list[Path] = []
     for namespace in sorted(touched):
-        kept_forms, kept_outcomes = retained.get(namespace, ([], {}))
+        kept_forms, kept_outcomes, kept_versions = retained.get(namespace, ([], {}, {}))
         path = _write_namespace(
             root,
             namespace,
@@ -307,6 +401,8 @@ def write_results(
             incoming.get(namespace, []),
             incoming_outcomes,
             file_key,
+            kept_versions=kept_versions,
+            classifier_version=classifier_version if namespace in incoming else None,
         )
         if path is not None:
             written.append(path)
@@ -328,7 +424,7 @@ def _dedupe(forms: list[dict]) -> list[dict]:
     seen = set()
     unique = []
     for form in forms:
-        key = (form.get("file"), form.get("id"), form.get("line"), form.get("hash"))
+        key = (form.get("file"), form.get("id"), form.get("line"), form.get("ordinal"), form.get("hash"))
         if key in seen:
             continue
         seen.add(key)

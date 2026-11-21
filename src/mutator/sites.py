@@ -38,9 +38,24 @@ _BINARY_PARENTS = {
     "boolean_operator",
 }
 
-_UNARY_PARENTS = {"unary_expression", "unary_operator", "not_operator"}
+_UNARY_PARENTS = {"unary_expression", "unary_operator", "not_operator", "prefix_unary_expression"}
 
 _BOOLEANS = {"true": "false", "false": "true", "True": "False", "False": "True"}
+
+_PS_COMPARISONS = {
+    "-eq": "-ne", "-ne": "-eq",
+    "-ceq": "-cne", "-cne": "-ceq",
+    "-ieq": "-ine", "-ine": "-ieq",
+    "-gt": "-ge", "-ge": "-gt",
+    "-cgt": "-cge", "-cge": "-cgt",
+    "-igt": "-ige", "-ige": "-igt",
+    "-lt": "-le", "-le": "-lt",
+    "-clt": "-cle", "-cle": "-clt",
+    "-ilt": "-ile", "-ile": "-ilt",
+}
+_PS_LOGIC = {"-and": "-or", "-or": "-and"}
+_PS_ARITH = {"+": "-", "-": "+", "*": "/", "/": "*"}
+_PS_BOOLS = {"$true": "$false", "$false": "$true"}
 
 _NUMBERS = {
     "decimal_integer_literal",
@@ -288,11 +303,53 @@ def _visit_binary(node, token: str, parent: str, language: str, found: list[RawS
 
 
 def _visit_optional(node, token: str, language: str, found: list[RawSite]) -> None:
-    if language != "typescript" or token != "?.":
+    if language == "typescript" and token == "?.":
+        optional = _optional_mutant(node)
+        if optional is not None:
+            _add(found, node, "?.", optional, "optional")
         return
-    optional = _optional_mutant(node)
-    if optional is not None:
-        _add(found, node, "?.", optional, "optional")
+    if language == "csharp" and token == "?" and _parent_type(node) == "conditional_access_expression":
+        parent = node.parent
+        if any(child.type == "member_binding_expression" for child in parent.children):
+            _add(found, node, "?", "", "optional")
+
+
+def _visit_powershell(node, data: bytes, found: list[RawSite]) -> None:
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == "ERROR" or current.is_missing:
+            continue
+        if current.type == "comment":
+            continue
+        if current.type in {"string_literal", "verbatim_string_characters", "expandable_string_literal"}:
+            continue
+        if current.type == "comparison_operator":
+            tok = _text(data, current).strip()
+            mut = _PS_COMPARISONS.get(tok.lower())
+            if mut is not None:
+                _add(found, current, tok, mut, "comparison")
+            continue
+        if current.type == "variable":
+            tok = _text(data, current).strip()
+            mut = _PS_BOOLS.get(tok.lower())
+            if mut is not None:
+                _add(found, current, tok, mut, "boolean")
+            continue
+        if current.child_count == 0:
+            tok = _text(data, current)
+            low = tok.lower()
+            parent = _parent_type(current)
+            if parent == "logical_expression" and low in _PS_LOGIC:
+                _add(found, current, tok, _PS_LOGIC[low], "logic")
+            elif parent == "expression_with_unary_operator" and low in {"-not", "!", "-"}:
+                _add(found, current, tok, "", "unary")
+            elif parent in {"additive_expression", "multiplicative_expression"} and tok in _PS_ARITH:
+                _add(found, current, tok, _PS_ARITH[tok], "arithmetic")
+            elif current.type in {"decimal_integer_literal", "integer_literal"} and tok in {"0", "1"}:
+                _add(found, current, tok, _flip01(tok), "constant")
+            continue
+        stack.extend(reversed(current.children))
 
 
 def _visit_not(node, token: str, parent: str, found: list[RawSite]) -> None:
@@ -337,6 +394,8 @@ def _visit_leaf(node, data: bytes, language: str, found: list[RawSite]) -> None:
 
 
 def _visit_node(node, data: bytes, language: str, found: list[RawSite]) -> None:
+    if node.type == "ERROR":
+        return
     if language == "typescript" and _in_type(node):
         return
     if node.child_count == 0:
@@ -350,6 +409,8 @@ def _visit(node, data: bytes, language: str, found: list[RawSite]) -> None:
     stack = [node]
     while stack:
         current = stack.pop()
+        if current.type == "ERROR":
+            continue
         _visit_node(current, data, language, found)
         stack.extend(reversed(current.children))
 
@@ -364,8 +425,16 @@ def discover_raw(source: str, language: str, path: str) -> list[RawSite]:
     found: list[RawSite] = []
     if language == "clojure":
         _visit_clojure(tree.root_node, data, found)
+    elif language == "powershell":
+        _visit_powershell(tree.root_node, data, found)
     else:
         _visit(tree.root_node, data, language, found)
+    lines = source.splitlines()
+    found = [
+        site
+        for site in found
+        if site.line <= len(lines) and "mutator:equivalent" not in lines[site.line - 1]
+    ]
     found.sort(key=lambda site: (site.line, site.start, site.end))
     return found
 

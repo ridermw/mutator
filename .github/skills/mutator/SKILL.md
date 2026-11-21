@@ -1,6 +1,6 @@
 ---
 name: mutator
-description: Use when running mutation tests, checking whether tests actually pin behavior, when mutator prints SURVIVED or UNCOVERED or exits 2 or 3, when considering --mutate-all, or when .metrics/mutate must be refreshed for uml-viewer, in Clojure, Java, Go, TypeScript, Rust, or Python projects.
+description: Use when running mutation tests, checking whether tests actually pin behavior, when mutator prints SURVIVED or UNCOVERED or exits 2 or 3, when considering --mutate-all, or when .metrics/mutate must be refreshed for uml-viewer, in Clojure, Java, Go, TypeScript, JavaScript, Rust, Python, C#, or PowerShell projects.
 ---
 
 # mutator

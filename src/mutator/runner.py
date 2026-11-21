@@ -97,6 +97,8 @@ class CommandRunner:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=environment,
             )
         except OSError as exc:
@@ -222,13 +224,55 @@ def _python_plan(root: Path, source: Path) -> tuple[Command, Path]:
     return _python_command(directory), directory
 
 
+def _csharp_plan(root: Path, source: Path) -> tuple[Command, Path]:
+    from mutator.crapper_link import ensure_crapper
+
+    target = ensure_crapper().runners.dotnet_target(root, [source])
+    rel = target.resolve().relative_to(root.resolve()).as_posix()
+    return ["dotnet", "test", rel, "--nologo", "--filter", "Category!=no-mutate"], root
+
+
+def _powershell_test_command(worker_root: Path, result_xml: Path) -> list[str]:
+    root_q = str(worker_root.resolve()).replace("'", "''")
+    xml_q = str(result_xml.resolve()).replace("'", "''")
+    src_dir = worker_root / "src"
+    module_roots = [str(worker_root.resolve())]
+    if src_dir.is_dir():
+        module_roots.insert(0, str(src_dir.resolve()))
+    ps_prefix = os.pathsep.join(module_roots).replace("'", "''")
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$env:PSModulePath = '{ps_prefix}' + [IO.Path]::PathSeparator + $env:PSModulePath; "
+        "Import-Module Pester -MinimumVersion 5.7.0 -Force; "
+        "$cfg = New-PesterConfiguration; "
+        f"$cfg.Run.Path = '{root_q}'; "
+        "$cfg.Run.PassThru = $true; "
+        "$cfg.Filter.ExcludeTag = @('no-mutate'); "
+        "$cfg.CodeCoverage.Enabled = $false; "
+        "$cfg.TestResult.Enabled = $true; "
+        "$cfg.TestResult.OutputFormat = 'NUnitXml'; "
+        f"$cfg.TestResult.OutputPath = '{xml_q}'; "
+        "$res = Invoke-Pester -Configuration $cfg; "
+        "if ($res.TotalCount -eq 0) { exit 2 }; "
+        "if ($res.FailedCount -gt 0) { exit 1 }; exit 0"
+    )
+    return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def _powershell_plan(root: Path, source: Path) -> tuple[Command, Path]:
+    del source
+    return _powershell_test_command(root, root / "target" / "mutator-pester-results.xml"), root
+
+
 _PLANS = {
     "clojure": _clojure_plan,
     "java": _java_plan,
+    "csharp": _csharp_plan,
     "go": _go_plan,
     "typescript": _typescript_plan,
     "rust": _rust_plan,
     "python": _python_plan,
+    "powershell": _powershell_plan,
 }
 
 
@@ -241,8 +285,226 @@ def test_plan(root: Path, source: Path, language: str, override: str | None) -> 
 
     root = root.resolve()
     if override:
+        if language == "csharp":
+            parts = shlex.split(override)
+            if any(part.split("=", 1)[0] == "--no-build" for part in parts):
+                raise ValueError(
+                    "C# mutations require recompilation; --no-build would test the original assembly"
+                )
+            if any(
+                Path(part).is_absolute() and Path(part).suffix.lower() in {".csproj", ".sln", ".slnx"}
+                for part in parts
+            ):
+                raise ValueError(
+                    "Use relative .NET project paths so tests build the worker, not the original tree"
+                )
         return override, root
     plan = _PLANS.get(language)
     if plan is None:
         return ["false"], root
     return plan(root, source)
+
+
+def parse_trx_outcome(trx_path: Path) -> str:
+    """Classify a VSTest TRX file into 'killed', 'survived', or 'error'."""
+
+    import xml.etree.ElementTree as ET
+
+    if not trx_path.is_file():
+        return "error"
+    try:
+        root = ET.parse(trx_path).getroot()
+    except (OSError, ET.ParseError):
+        return "error"
+    counters = None
+    for elem in root.iter():
+        if elem.tag.rpartition("}")[2] == "Counters":
+            counters = elem
+            break
+    if counters is None:
+        return "error"
+    try:
+        executed = int(counters.get("executed", "0"))
+        failed = int(counters.get("failed", "0"))
+        errors = int(counters.get("error", "0"))
+        timeout_count = int(counters.get("timeout", "0"))
+    except ValueError:
+        return "error"
+    if executed <= 0:
+        return "error"
+    if failed > 0 or timeout_count > 0:
+        return "killed"
+    if errors > 0:
+        return "error"
+    return "survived"
+
+
+def parse_nunit_outcome(xml_path: Path) -> str:
+    """Classify a Pester NUnitXml result file into 'killed', 'survived', or 'error'."""
+
+    import xml.etree.ElementTree as ET
+
+    if not xml_path.is_file():
+        return "error"
+    try:
+        root = ET.parse(xml_path).getroot()
+    except (OSError, ET.ParseError):
+        return "error"
+    if root.tag != "test-results":
+        return "error"
+    try:
+        total = int(root.get("total", "0"))
+        failures = int(root.get("failures", "0"))
+        errors = int(root.get("errors", "0"))
+    except ValueError:
+        return "error"
+    if total <= 0:
+        return "error"
+    if failures > 0:
+        return "killed"
+    if errors > 0:
+        return "error"
+    return "survived"
+
+
+def parse_trx_directory(trx_dir: Path) -> str:
+    """Aggregate all VSTest .trx reports in `trx_dir` into 'killed', 'survived', or 'error'."""
+
+    import xml.etree.ElementTree as ET
+
+    if not trx_dir.is_dir():
+        return "error"
+    trx_files = sorted(trx_dir.rglob("*.trx"))
+    if not trx_files:
+        return "error"
+    total_executed = total_failed = total_errors = total_timeouts = 0
+    for trx_path in trx_files:
+        try:
+            root = ET.parse(trx_path).getroot()
+        except (OSError, ET.ParseError):
+            return "error"
+        counters = None
+        for elem in root.iter():
+            if elem.tag.rpartition("}")[2] == "Counters":
+                counters = elem
+                break
+        if counters is None:
+            return "error"
+        try:
+            executed = int(counters.get("executed", "0"))
+            failed = int(counters.get("failed", "0"))
+            errors = int(counters.get("error", "0"))
+            timeout_count = int(counters.get("timeout", "0"))
+        except ValueError:
+            return "error"
+        total_executed += executed
+        total_failed += failed
+        total_errors += errors
+        total_timeouts += timeout_count
+    if total_executed <= 0:
+        return "error"
+    if total_failed > 0 or total_timeouts > 0:
+        return "killed"
+    if total_errors > 0:
+        return "error"
+    return "survived"
+
+
+def execute_csharp_phased(
+    runner: CommandRunner,
+    worker: Path,
+    target_rel: str,
+    build_timeout: float,
+    test_timeout: float,
+) -> str:
+    """Phased C# mutant execution: build first (compiler errors -> invalid),
+    then test with per-project/TFM TRX structured evidence."""
+
+    import re
+
+    build = runner.run(
+        ["dotnet", "build", target_rel, "-c", "Debug", "--nologo", "--no-restore"],
+        worker,
+        build_timeout,
+    )
+    if build.timed_out:
+        return "error"
+    if build.code != 0:
+        if re.search(r"\berror\s+CS\d{4}\b", build.output):
+            return "invalid"
+        return "error"
+
+    trx_dir = worker / ".mutator-trx"
+    if trx_dir.exists():
+        import shutil
+        shutil.rmtree(trx_dir, ignore_errors=True)
+    trx_dir.mkdir(parents=True, exist_ok=True)
+
+    test_res = runner.run(
+        [
+            "dotnet",
+            "test",
+            target_rel,
+            "-c",
+            "Debug",
+            "--no-build",
+            "--nologo",
+            "--filter",
+            "Category!=no-mutate",
+            "--logger",
+            "trx",
+            "--results-directory",
+            str(trx_dir),
+        ],
+        worker,
+        test_timeout,
+    )
+    if test_res.timed_out:
+        return "killed"
+    outcome = parse_trx_directory(trx_dir)
+    if outcome == "survived" and test_res.code != 0:
+        return "error"
+    return outcome
+
+
+def execute_powershell_phased(
+    runner: CommandRunner,
+    worker: Path,
+    mutated_file: Path,
+    test_timeout: float,
+) -> str:
+    """Phased PowerShell mutant execution: syntax check -> Pester NUnitXml."""
+
+    file_q = str(mutated_file.resolve()).replace("'", "''")
+    parse_check = runner.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                "$tok=$null; $err=$null; "
+                f"[void][System.Management.Automation.Language.Parser]::ParseFile('{file_q}', [ref]$tok, [ref]$err); "
+                "if ($err -and $err.Count -gt 0) { exit 3 }"
+            ),
+        ],
+        worker,
+        15.0,
+    )
+    if parse_check.timed_out:
+        return "error"
+    if parse_check.code == 3:
+        return "invalid"
+    if parse_check.code != 0:
+        return "error"
+
+    xml_path = worker / ".mutator-pester-results.xml"
+    xml_path.unlink(missing_ok=True)
+    cmd = _powershell_test_command(worker, xml_path)
+    test_res = runner.run(cmd, worker, test_timeout)
+    if test_res.timed_out:
+        return "killed"
+    outcome = parse_nunit_outcome(xml_path)
+    if outcome == "survived" and test_res.code != 0:
+        return "error"
+    return outcome

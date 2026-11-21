@@ -6,12 +6,14 @@ import sys
 from pathlib import Path
 
 from mutator.crapper_link import ensure_crapper
-from mutator.functions import form_digests, form_spans, sites_in_file
-from mutator.metrics import load_history, source_key, write_results
+from mutator.functions import form_declarations, form_digests, form_spans, sites_in_file
+from mutator.metrics import CLASSIFIER_VERSION, load_history, source_key, write_results
 from mutator.model import FormResult, RunResult, Site
 from mutator.report import format_scan
 from mutator.runner import Command, CommandRunner, display_command, test_plan
 from mutator.workers import run_mutants
+
+_VERSIONED_LANGUAGES = frozenset({"csharp", "powershell"})
 
 
 def restore_backups(root: Path) -> list[Path]:
@@ -41,15 +43,6 @@ def _drop_bytecode(path: Path) -> None:
         item.unlink(missing_ok=True)
 
 
-def _backup(root: Path, path: Path, original: bytes) -> Path:
-    relative = path.resolve().relative_to(root.resolve())
-    backup = root / "target" / "mutator-backup" / relative
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    if not backup.exists():
-        backup.write_bytes(original)
-    return backup
-
-
 def _covered(site: Site, lines: set[int] | None, ignore_coverage: bool) -> bool:
     if ignore_coverage:
         return True
@@ -58,13 +51,31 @@ def _covered(site: Site, lines: set[int] | None, ignore_coverage: bool) -> bool:
     return site.line in lines or site.anchor_line in lines
 
 
+def _cache_valid(history, namespace: str, language: str | None) -> bool:
+    if language in _VERSIONED_LANGUAGES:
+        return history.classifier_versions.get(namespace) == CLASSIFIER_VERSION
+    return True
+
+
+def _is_unchanged(site: Site, history, digests: dict, language: str | None) -> bool:
+    if language in _VERSIONED_LANGUAGES:
+        dkey = (site.namespace, site.form_id, site.form_ordinal)
+        prior = history.declaration_forms.get(dkey)
+        if prior is not None and dkey in digests:
+            return prior.digest == digests[dkey]
+    key = (site.namespace, site.form_id)
+    prior = history.forms.get(key)
+    return prior is not None and prior.digest == digests.get(key)
+
+
 def _select(
     sites: list[Site],
     covered: dict[str, bool],
     history,
-    digests: dict[tuple[str, str], str],
+    digests: dict,
     mutate_all: bool,
     lines: set[int] | None,
+    language: str | None = None,
 ) -> list[Site]:
     chosen = []
     for site in sites:
@@ -72,30 +83,69 @@ def _select(
             continue
         if lines is not None and site.line not in lines:
             continue
-        key = (site.namespace, site.form_id)
-        prior = history.forms.get(key)
-        unchanged = prior is not None and prior.digest == digests.get(key)
+        unchanged = _is_unchanged(site, history, digests, language)
         if mutate_all or not unchanged:
             chosen.append(site)
             continue
-        if history.outcomes.get(site.mutation_id) == "killed":
+        if (
+            _cache_valid(history, site.namespace, language)
+            and history.outcomes.get(site.mutation_id) == "killed"
+        ):
             continue
         chosen.append(site)
     return chosen
 
 
-def _carry_forward(sites: list[Site], covered: dict[str, bool], history, digests) -> dict[str, str]:
+def _carry_forward(
+    sites: list[Site],
+    covered: dict[str, bool],
+    history,
+    digests: dict,
+    language: str | None = None,
+) -> dict[str, str]:
     by_id = {site.mutation_id: site for site in sites}
     carried = {}
     for mutation, status in history.outcomes.items():
         site = by_id.get(mutation)
         if site is None or not covered[site.mutation_id]:
             continue
-        key = (site.namespace, site.form_id)
-        prior = history.forms.get(key)
-        if prior is not None and prior.digest == digests.get(key):
+        if status == "killed" and not _cache_valid(history, site.namespace, language):
+            continue
+        if status not in {"killed", "survived"}:
+            continue
+        if _is_unchanged(site, history, digests, language):
             carried[mutation] = status
     return carried
+
+
+def _tally_sites(
+    owned: list[Site], covered: dict[str, bool], outcomes: dict[str, str], lines: set[int] | None
+) -> tuple[int, int, int, int, int, bool]:
+    killed = survived = uncovered = invalid = errors = 0
+    incomplete = False
+    for site in owned:
+        if not covered[site.mutation_id]:
+            uncovered += 1
+            continue
+        status = outcomes.get(site.mutation_id)
+        if status == "killed":
+            killed += 1
+        elif status == "survived":
+            survived += 1
+        elif status == "invalid":
+            invalid += 1
+        elif status == "error":
+            errors += 1
+            incomplete = True
+        elif lines is not None and site.line not in lines:
+            # Intentionally unselected by --lines: not an execution error, but the
+            # form's full mutation picture is incomplete.
+            incomplete = True
+        else:
+            # Missing or unknown status on an expected site is an error, never a survivor.
+            errors += 1
+            incomplete = True
+    return killed, survived, uncovered, invalid, errors, incomplete
 
 
 def _forms(
@@ -108,6 +158,41 @@ def _forms(
     outcomes: dict[str, str],
     lines: set[int] | None,
 ) -> list[FormResult]:
+    crapper = ensure_crapper()
+    language = crapper.discover.language_of(path)
+    if language in _VERSIONED_LANGUAGES:
+        declarations = form_declarations(source, path, root)
+        grouped_decl: dict[tuple[str, str, int], list[Site]] = {}
+        for site in sites:
+            grouped_decl.setdefault((site.namespace, site.form_id, site.form_ordinal), []).append(site)
+        forms = []
+        for namespace, form, start, end, name, private, dg, ordinal in declarations:
+            owned = grouped_decl.get((namespace, form, ordinal), [])
+            killed, survived, uncovered, invalid, errors, incomplete = _tally_sites(
+                owned, covered, outcomes, lines
+            )
+            forms.append(
+                FormResult(
+                    id=form,
+                    namespace=namespace,
+                    name=name,
+                    private=private,
+                    file=file_key,
+                    line=start,
+                    end_line=end,
+                    digest=dg,
+                    killed=killed,
+                    survived=survived,
+                    uncovered=uncovered,
+                    sites=len(owned),
+                    invalid=invalid,
+                    errors=errors,
+                    incomplete=incomplete,
+                    ordinal=ordinal,
+                )
+            )
+        return forms
+
     spans = form_spans(source, path, root)
     digests = form_digests(source, path, root)
     grouped: dict[tuple[str, str], list[Site]] = {}
@@ -117,18 +202,9 @@ def _forms(
     for key, (start, end, name, private) in sorted(spans.items(), key=lambda item: item[1][0]):
         namespace, form = key
         owned = grouped.get(key, [])
-        killed = survived = uncovered = 0
-        for site in owned:
-            if not covered[site.mutation_id]:
-                uncovered += 1
-                continue
-            status = outcomes.get(site.mutation_id)
-            if status == "killed":
-                killed += 1
-            elif status == "survived":
-                survived += 1
-            elif lines is None:
-                survived += 1
+        killed, survived, uncovered, invalid, errors, incomplete = _tally_sites(
+            owned, covered, outcomes, lines
+        )
         forms.append(
             FormResult(
                 id=form,
@@ -143,6 +219,9 @@ def _forms(
                 survived=survived,
                 uncovered=uncovered,
                 sites=len(owned),
+                invalid=invalid,
+                errors=errors,
+                incomplete=incomplete,
             )
         )
     return forms
@@ -222,26 +301,55 @@ def _apply_selected(
 ) -> RunResult | None:
     if not selected:
         return None
-    command, cwd = test_plan(root, path, language, test_command)
+    try:
+        command, cwd = test_plan(root, path, language, test_command)
+    except ValueError as exc:
+        return RunResult(
+            path=file_key,
+            forms=[],
+            written=[],
+            baseline_failed=True,
+            baseline_message=str(exc),
+        )
     cache_key = (_command_key(command), str(cwd))
     _remember_baseline(baselines, cache_key, runner, command, cwd)
     ok, seconds, tail = baselines[cache_key]
     if not ok:
         return _baseline_failure(file_key, command, tail)
     timeout = max(2.0, seconds * timeout_factor)
-    run_mutants(
-        root,
-        path,
-        original,
-        selected,
-        max_workers,
-        runner,
-        command,
-        cwd,
-        timeout,
-        file_key,
-        outcomes,
-    )
+    try:
+        worker_err = run_mutants(
+            root,
+            path,
+            original,
+            selected,
+            max_workers,
+            runner,
+            command,
+            cwd,
+            timeout,
+            file_key,
+            outcomes,
+            language=language,
+            timeout_factor=timeout_factor,
+            custom_override=bool(test_command),
+        )
+    except ValueError as exc:
+        return RunResult(
+            path=file_key,
+            forms=[],
+            written=[],
+            baseline_failed=True,
+            baseline_message=str(exc),
+        )
+    if worker_err is not None:
+        return RunResult(
+            path=file_key,
+            forms=[],
+            written=[],
+            baseline_failed=True,
+            baseline_message=worker_err,
+        )
     return None
 
 
@@ -253,11 +361,6 @@ def _statuses(found: list[Site], covered: dict[str, bool], outcomes: dict[str, s
         elif site.mutation_id in outcomes:
             statuses[site.mutation_id] = outcomes[site.mutation_id]
     return statuses
-
-
-def _restore_if_dirty(path: Path, original: bytes) -> None:
-    if path.read_bytes() != original:
-        path.write_bytes(original)
 
 
 def mutate_file(
@@ -292,9 +395,19 @@ def mutate_file(
     covered = _coverage_map(found, covered_lines, ignore_coverage)
     _warn_uncovered(file_key, found, covered_lines, ignore_coverage)
     history = load_history(root, file_key)
-    digests = form_digests(source, path, root)
-    selected = _select(found, covered, history, digests, mutate_all, lines)
-    outcomes = _carry_forward(found, covered, history, digests)
+    digests: dict = dict(form_digests(source, path, root))
+    if language in _VERSIONED_LANGUAGES:
+        for ns, fid, _s, _e, _nm, _pr, dg, ordinal in form_declarations(source, path, root):
+            digests[(ns, fid, ordinal)] = dg
+    bypass_cache = bool(test_command and language in _VERSIONED_LANGUAGES)
+    selected = _select(
+        found, covered, history, digests, mutate_all or bypass_cache, lines, language=language
+    )
+    outcomes = (
+        {}
+        if bypass_cache
+        else _carry_forward(found, covered, history, digests, language=language)
+    )
     _warn_many(file_key, selected, mutation_warning)
     failure = _apply_selected(
         path,
@@ -313,14 +426,21 @@ def mutate_file(
     if failure is not None:
         return failure
     forms = _forms(source, path, root, file_key, found, covered, outcomes, lines)
-    written = write_results(root, file_key, forms, outcomes)
-    _restore_if_dirty(path, original)
+    incomplete = any(form.incomplete for form in forms)
+    # Only stamp phased classifier version when phased execution actually ran (never custom overrides).
+    classifier_version = (
+        CLASSIFIER_VERSION
+        if (language in _VERSIONED_LANGUAGES and not test_command)
+        else None
+    )
+    written = write_results(root, file_key, forms, outcomes, classifier_version=classifier_version)
     return RunResult(
         path=file_key,
         forms=forms,
         written=[item.as_posix() for item in written],
         sites=found,
         statuses=_statuses(found, covered, outcomes),
+        incomplete=incomplete,
     )
 
 
@@ -337,20 +457,28 @@ def scan_file(
     root = root.resolve()
     path = path.resolve()
     file_key = source_key(path, root)
-    source = path.read_text(encoding="utf-8")
+    decoded = _decode(path)
+    if decoded is None:
+        return f"Skipped {file_key}: file is not UTF-8\n"
+    _original, source = decoded
     found = sites_in_file(source, path, root, file_key)
     if lines is not None:
         found = [site for site in found if site.line in lines]
-    covered = None
-    if not ignore_coverage and covered_lines is not None:
-        covered = _coverage_map(found, covered_lines, ignore_coverage)
+    covered = _coverage_map(found, covered_lines, ignore_coverage)
     history = load_history(root, file_key)
-    digests = form_digests(source, path, root)
-    changed = set()
-    if history.forms:
+    crapper = ensure_crapper()
+    language = crapper.discover.language_of(path)
+    if language in _VERSIONED_LANGUAGES:
+        changed = set()
+        for ns, fid, _s, _e, _nm, _pr, dg, ordinal in form_declarations(source, path, root):
+            prior = history.declaration_forms.get((ns, fid, ordinal))
+            if prior is None or prior.digest != dg:
+                changed.add((ns, fid))
+    else:
+        digests = form_digests(source, path, root)
         changed = {
             key
-            for key, digest in digests.items()
-            if key not in history.forms or history.forms[key].digest != digest
+            for key, value in digests.items()
+            if key not in history.forms or history.forms[key].digest != value
         }
-    return format_scan(file_key, found, changed, covered)
+    return format_scan(file_key, found, changed, None if ignore_coverage else covered)
