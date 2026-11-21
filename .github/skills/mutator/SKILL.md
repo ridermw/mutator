@@ -10,7 +10,10 @@ description: Use when running mutation tests, checking whether tests actually pi
 mutator changes one operator or constant at a time (`<` to `<=`, `and` to
 `or`, `True` to `False`, `0` to `1`) and runs the tests. **Killed:** a test
 failed. **Survived:** the tests still pass, so nothing pins that behavior.
-**Uncovered:** no test reaches the line, so it is not run. The score is
+**Uncovered:** no test reaches the line, so it is not run. On C# and
+PowerShell (phased build/parse then test), **Invalid** means a compiler or
+syntax error (excluded from the score denominator) and **Error** means a
+runner/infra failure (marks the form/run **Incomplete**). The score is
 killed / (killed + survived).
 
 ## Run
@@ -28,8 +31,10 @@ directory. It needs crapper installed or checked out beside it (`../crapper`).
 | `mutator --max-workers 2 FILE` | cap parallel workers |
 
 Exit 0: every mutant was killed. **Exit 3: a mutant survived. That is a
-result, not an error;** read the SURVIVED lines. Exit 2: the baseline tests
-fail and nothing was written; fix the tests first.
+result, not an error;** read the SURVIVED lines. Exit 4: incomplete run
+(runner/infra errors or partial `--lines` selection; score is marked
+incomplete rather than green). Exit 2: the baseline tests fail and nothing
+was written; fix the tests first.
 
 ## Differential is the default
 
