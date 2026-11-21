@@ -55,6 +55,10 @@ def _forms_of(data: dict) -> list[dict]:
     return [form for form in forms if isinstance(form, dict)]
 
 
+_RECORDABLE_OUTCOMES = {"killed", "survived", "invalid", "error"}
+CLASSIFIER_VERSION = 2
+
+
 def _outcomes_of(data: dict) -> dict[str, str]:
     raw = data.get("outcomes")
     if not isinstance(raw, dict):
@@ -64,7 +68,7 @@ def _outcomes_of(data: dict) -> dict[str, str]:
         if not isinstance(key, str):
             continue
         status = value[1:] if isinstance(value, str) and value.startswith(":") else value
-        if status in {"killed", "survived"}:
+        if status in _RECORDABLE_OUTCOMES:
             found[key] = status
     return found
 
@@ -104,7 +108,7 @@ def _remember_outcomes(history: History, data: dict, file_key: str) -> None:
 
 
 def load_history(root: Path, file_key: str) -> History:
-    """Prior form hashes and outcomes recorded for `file_key`."""
+    """Prior form hashes, outcomes, and classifier versions recorded for `file_key`."""
 
     history = History()
     for path in _edn_files(root):
@@ -114,13 +118,16 @@ def load_history(root: Path, file_key: str) -> History:
         namespace = data.get("namespace")
         if not isinstance(namespace, str):
             continue
+        cv = data.get("classifier-version")
+        if isinstance(cv, int):
+            history.classifier_versions[namespace] = cv
         _remember_forms(history, data, namespace, file_key)
         _remember_outcomes(history, data, file_key)
     return history
 
 
 def _render_form(form: FormResult) -> dict:
-    return {
+    entry = {
         "id": form.id,
         "kind": "defn-" if form.private else "defn",
         "file": form.file,
@@ -132,10 +139,23 @@ def _render_form(form: FormResult) -> dict:
         "uncovered": form.uncovered,
         "sites": form.sites,
     }
+    if form.invalid:
+        entry["invalid"] = form.invalid
+    if form.errors:
+        entry["errors"] = form.errors
+    if form.incomplete:
+        entry["incomplete"] = True
+    return entry
 
 
-def _render_snapshot(namespace: str, source: str, forms: list[dict], outcomes: dict[str, str]) -> str:
-    payload = {
+def _render_snapshot(
+    namespace: str,
+    source: str,
+    forms: list[dict],
+    outcomes: dict[str, str],
+    classifier_version: int | None = None,
+) -> str:
+    payload: dict = {
         "version": 1,
         "tested-at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source": source,
@@ -143,6 +163,10 @@ def _render_snapshot(namespace: str, source: str, forms: list[dict], outcomes: d
         "outcomes": {key: keyword(outcomes[key]) for key in sorted(outcomes)},
         "forms": forms,
     }
+    if classifier_version is not None:
+        payload["classifier-version"] = classifier_version
+    if any(form.get("incomplete") for form in forms):
+        payload["incomplete"] = True
     text = dumps(payload)
     # Keep the file readable. dumps is one line; break after the top-level pairs
     # is unnecessary because clojure.edn reads either shape.
@@ -173,7 +197,7 @@ def _file_outcomes(outcomes: dict[str, str], file_key: str) -> dict[str, str]:
     for mutation, status in outcomes.items():
         if mutation_file(mutation) != file_key:
             continue
-        if status not in {"killed", "survived"}:
+        if status not in _RECORDABLE_OUTCOMES:
             continue
         found[mutation] = status
     return found
@@ -245,6 +269,7 @@ def _write_namespace(
     fresh: list[FormResult],
     outcomes: dict[str, str],
     file_key: str,
+    classifier_version: int | None = None,
 ) -> Path | None:
     rendered = _dedupe(kept_forms + [_render_form(form) for form in fresh])
     rendered.sort(key=_form_order)
@@ -257,7 +282,13 @@ def _write_namespace(
         return None
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        _render_snapshot(namespace, _snapshot_source(fresh, kept_forms, file_key), rendered, merged),
+        _render_snapshot(
+            namespace,
+            _snapshot_source(fresh, kept_forms, file_key),
+            rendered,
+            merged,
+            classifier_version=classifier_version,
+        ),
         encoding="utf-8",
     )
     return path
@@ -281,7 +312,12 @@ def _drop_stale(existing, touched: set[str], canonical: set[Path], file_key: str
 
 
 def write_results(
-    root: Path, file_key: str, forms: list[FormResult], outcomes: dict[str, str]
+    root: Path,
+    file_key: str,
+    forms: list[FormResult],
+    outcomes: dict[str, str],
+    *,
+    classifier_version: int | None = None,
 ) -> list[Path]:
     """Replace this file's forms, preserving other files that share a namespace.
 
@@ -307,6 +343,7 @@ def write_results(
             incoming.get(namespace, []),
             incoming_outcomes,
             file_key,
+            classifier_version=classifier_version if namespace in incoming else None,
         )
         if path is not None:
             written.append(path)

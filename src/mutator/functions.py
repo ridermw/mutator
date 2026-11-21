@@ -11,6 +11,11 @@ from mutator.crapper_link import ensure_crapper
 from mutator.model import Site
 from mutator.sites import discover_raw
 
+_PS_EXPORT_RE = re.compile(
+    r"Export-ModuleMember\b[^\n]*?-Function\s+([^\r\n;#|]+)",
+    re.IGNORECASE,
+)
+
 
 def _lines(source: str) -> list[str]:
     return source.splitlines()
@@ -46,12 +51,40 @@ def _typescript_private(name: str, header: str) -> bool:
     return name.startswith("#") or bool(re.search(r"\bprivate\b", header))
 
 
+def _powershell_static_exports(source: str) -> set[str] | None:
+    """Static Export-ModuleMember -Function names (lowercased), or None if absent/dynamic."""
+
+    matches = _PS_EXPORT_RE.findall(source)
+    if not matches:
+        return None
+    exported: set[str] = set()
+    for expr in matches:
+        if "$" in expr or "*" in expr:
+            return None
+        for item in expr.strip().lstrip("@(").rstrip(")").split(","):
+            cleaned = item.strip().strip("'\"")
+            if cleaned:
+                exported.add(cleaned.lower())
+    return exported or None
+
+
 def is_private(language: str, name: str, source: str, start: int, end: int) -> bool:
     """True when uml-viewer should treat the operation as private."""
 
     header = _header(source, start, end)
     if language == "clojure":
         return bool(re.match(r"\(defn-", header))
+    if language == "csharp":
+        if re.search(r"\bprivate\b", header):
+            return True
+        return not re.search(r"\b(public|protected|internal)\b", header)
+    if language == "powershell":
+        if re.search(r"\bhidden\b", header, re.IGNORECASE):
+            return True
+        exports = _powershell_static_exports(source)
+        if exports is not None and name.lower() not in exports:
+            return True
+        return False
     if language == "java":
         return bool(re.search(r"\bprivate\b", header))
     if language == "go":
@@ -77,10 +110,21 @@ def form_id(name: str, private: bool) -> str:
 
 
 def mutation_id(
-    file: str, namespace: str, form: str, start: int, end: int, original: str, mutant: str
+    file: str,
+    namespace: str,
+    form: str,
+    ordinal: int,
+    start: int,
+    end: int,
+    original: str,
+    mutant: str,
 ) -> str:
+    """`ordinal` counts functions sharing one form id, and `start`/`end` are
+    bytes from the start of the function's first line, so an id survives moving
+    the function vertically as its digest does."""
+
     return json.dumps(
-        [file, namespace, form, start, end, original, mutant], separators=(",", ":")
+        [file, namespace, form, ordinal, start, end, original, mutant], separators=(",", ":")
     )
 
 
@@ -140,6 +184,27 @@ def _owner(functions, line: int, byte: int | None = None):
     return min(matches, key=lambda fn: (_tightness(fn), fn.start_line))
 
 
+def _line_starts(source: str) -> list[int]:
+    """Byte offset of each line, 1-indexed via starts[line - 1]."""
+
+    starts = [0]
+    for line in source.encode("utf-8").splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return starts
+
+
+def _ordinals(functions, privacy: dict[int, bool]) -> dict[int, int]:
+    """Each function's place among those sharing its namespace and form id."""
+
+    seen: dict[tuple[str, str], int] = {}
+    ordinals = {}
+    for fn in sorted(functions, key=lambda fn: (fn.start_line, fn.end_line)):
+        key = (fn.namespace, form_id(fn.name, privacy[id(fn)]))
+        ordinals[id(fn)] = seen.get(key, 0)
+        seen[key] = ordinals[id(fn)] + 1
+    return ordinals
+
+
 def sites_in_file(source: str, path: Path, root: Path, file_key: str) -> list[Site]:
     crapper = ensure_crapper()
     language = crapper.discover.language_of(path)
@@ -149,6 +214,8 @@ def sites_in_file(source: str, path: Path, root: Path, file_key: str) -> list[Si
     privacy = {
         id(fn): is_private(language, fn.name, source, fn.start_line, fn.end_line) for fn in functions
     }
+    ordinals = _ordinals(functions, privacy)
+    line_starts = _line_starts(source)
     found: list[Site] = []
     for raw in discover_raw(source, language, path.as_posix()):
         owner = _owner(functions, raw.line, raw.start)
@@ -156,6 +223,7 @@ def sites_in_file(source: str, path: Path, root: Path, file_key: str) -> list[Si
             continue
         private = privacy[id(owner)]
         form = form_id(owner.name, private)
+        base = line_starts[owner.start_line - 1]
         found.append(
             Site(
                 file=file_key,
@@ -169,9 +237,17 @@ def sites_in_file(source: str, path: Path, root: Path, file_key: str) -> list[Si
                 mutant=raw.mutant,
                 category=raw.category,
                 mutation_id=mutation_id(
-                    file_key, owner.namespace, form, raw.start, raw.end, raw.original, raw.mutant
+                    file_key,
+                    owner.namespace,
+                    form,
+                    ordinals[id(owner)],
+                    raw.start - base,
+                    raw.end - base,
+                    raw.original,
+                    raw.mutant,
                 ),
                 anchor_line=raw.anchor_line,
+                form_line=owner.start_line,
             )
         )
     return found
@@ -212,3 +288,25 @@ def form_spans(source: str, path: Path, root: Path) -> dict[tuple[str, str], tup
         start, end, name, private_flag = spans[key]
         spans[key] = (min(start, fn.start_line), max(end, fn.end_line), name, private_flag)
     return spans
+
+
+def form_declarations(source: str, path: Path, root: Path) -> list[tuple[str, str, int, int, str, bool, str]]:
+    """Every distinct declaration in source order: `(namespace, form_id, start, end, name, private, digest)`."""
+
+    crapper = ensure_crapper()
+    language = crapper.discover.language_of(path) or ""
+    declarations = []
+    for fn in sorted(project_functions(source, path, root), key=lambda f: (f.start_line, f.end_line)):
+        private = is_private(language, fn.name, source, fn.start_line, fn.end_line)
+        declarations.append(
+            (
+                fn.namespace,
+                form_id(fn.name, private),
+                fn.start_line,
+                fn.end_line,
+                fn.name,
+                private,
+                digest(source, fn.start_line, fn.end_line),
+            )
+        )
+    return declarations

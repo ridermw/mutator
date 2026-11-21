@@ -27,12 +27,10 @@ from mutator.coverage import _candidates, _jacoco_index, covered_lines
 from mutator.crapper_link import ensure_crapper
 from mutator.edn import loads
 from mutator.engine import (
-    _backup,
     _carry_forward,
     _covered,
     _drop_bytecode,
     _forms,
-    _restore_if_dirty,
     mutate_file,
     restore_backups,
     scan_file,
@@ -621,9 +619,6 @@ def test_backups_bytecode_and_a_dirty_file_are_put_back(tmp_path):
     path = tmp_path / "src" / "demo.py"
     path.parent.mkdir()
     path.write_bytes(b"one")
-    saved = _backup(tmp_path, path, b"one")
-    assert saved.read_bytes() == b"one"
-    assert _backup(tmp_path, path, b"two").read_bytes() == b"one"
 
     cache = path.parent / "__pycache__"
     cache.mkdir()
@@ -631,10 +626,6 @@ def test_backups_bytecode_and_a_dirty_file_are_put_back(tmp_path):
     compiled.write_bytes(b"pyc")
     _drop_bytecode(path)
     assert not compiled.exists()
-
-    path.write_bytes(b"dirty")
-    _restore_if_dirty(path, b"clean")
-    assert path.read_bytes() == b"clean"
 
 
 def test_selection_coverage_and_timeouts_keep_their_boundaries(tmp_path, capsys, monkeypatch):
@@ -662,7 +653,9 @@ def test_selection_coverage_and_timeouts_keep_their_boundaries(tmp_path, capsys,
     assert counted[0].survived == 1
     assert counted[0].killed == 0
     missing = _forms("x", path, tmp_path, "src/demo.py", [owned], {"m": True}, {}, None)
-    assert missing[0].survived == 1
+    assert missing[0].survived == 0
+    assert missing[0].errors == 1
+    assert missing[0].incomplete is True
 
     history = History(
         forms={("demo", "defn/place"): PriorForm("demo", "defn/place", "old", "src/demo.py")},
@@ -881,7 +874,7 @@ def test_snapshots_keep_other_files_empty_directories_and_odd_records(tmp_path):
         + "\n",
         encoding="utf-8",
     )
-    foreign = mutation_id("b.go", "demo", "defn/Stop", 1, 2, "+", "-")
+    foreign = mutation_id("b.go", "demo", "defn/Stop", 0, 1, 2, "+", "-")
     snapshot_path(tmp_path, "demo").write_text(
         dumps(
             {

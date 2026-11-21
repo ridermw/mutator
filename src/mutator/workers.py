@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
 from threading import Lock
 
 from mutator.model import Site
-from mutator.runner import Command
+from mutator.runner import Command, execute_csharp_phased, execute_powershell_phased
 from mutator.sites import apply_site
 
 # Build output and the worker tree itself must not be shared. A link to
@@ -44,6 +47,40 @@ SKIP_LINK = frozenset(
         ".gradle",
     }
 )
+
+# Directories that usually hold build output, but may be git-tracked source.
+OUTPUT_DIRS = frozenset({"target", "dist", "build", "out", "coverage"})
+_CSHARP_SKIP_COPY = SKIP_LINK | {"bin", "obj", "TestResults", ".worktrees", "node_modules"}
+_POWERSHELL_SKIP_COPY = SKIP_LINK | {".worktrees", "node_modules"}
+_ESCAPING_OUTPUT_TAGS = {"OutputPath", "BaseOutputPath", "BaseIntermediateOutputPath", "IntermediateOutputPath"}
+
+
+def tracked_directories(root: Path) -> frozenset[str]:
+    """Directories under root that hold files git tracks, relative to root."""
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True, env=env
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return frozenset()
+    found = set()
+    for name in listed.decode("utf-8", "surrogateescape").split("\0"):
+        parent = PurePosixPath(name).parent
+        while parent != PurePosixPath("."):
+            found.add(parent.as_posix())
+            parent = parent.parent
+    return frozenset(found)
+
+
+def _skipped(child: Path, root: Path, tracked: frozenset[str]) -> bool:
+    if child.name not in SKIP_LINK:
+        return False
+    if child.name not in OUTPUT_DIRS:
+        return True
+    relative = child.relative_to(root).as_posix()
+    return relative == "target" or relative not in tracked
 
 CONFIGS = (
     "deps.edn",
@@ -119,11 +156,13 @@ def _copy_configs(worker: Path, root: Path, relative: str) -> None:
         (worker / name).write_bytes(source.read_bytes())
 
 
-def _link_children(worker_dir: Path, real_dir: Path, skip: set[str]) -> None:
+def _link_children(
+    worker_dir: Path, real_dir: Path, skip: set[str], root: Path, tracked: frozenset[str]
+) -> None:
     if not real_dir.is_dir():
         return
     for child in real_dir.iterdir():
-        if child.name in skip or child.name in SKIP_LINK:
+        if child.name in skip or _skipped(child, root, tracked):
             continue
         destination = worker_dir / child.name
         if destination.exists() or destination.is_symlink():
@@ -224,7 +263,7 @@ def importers_of(root: Path, relative: str) -> set[str]:
     return {path.relative_to(root_resolved).as_posix() for path in found}
 
 
-def _expand_directory(link: Path, real_dir: Path) -> None:
+def _expand_directory(link: Path, real_dir: Path, root: Path, tracked: frozenset[str]) -> None:
     """Replace a linked directory so a copied module is not written through it."""
 
     if not real_dir.is_dir():
@@ -232,19 +271,19 @@ def _expand_directory(link: Path, real_dir: Path) -> None:
     link.unlink()
     link.mkdir()
     for child in real_dir.iterdir():
-        if child.name in SKIP_LINK:
+        if _skipped(child, root, tracked):
             continue
         symlink(link / child.name, child)
 
 
-def _copy_importer(worker: Path, root: Path, relative: str) -> None:
+def _copy_importer(worker: Path, root: Path, relative: str, tracked: frozenset[str]) -> None:
     real = root
     current = worker
     for segment in relative.split("/")[:-1]:
         real = real / segment
         current = current / segment
         if current.is_symlink():
-            _expand_directory(current, real)
+            _expand_directory(current, real, root, tracked)
         elif not current.exists():
             current.mkdir(parents=True)
     destination = worker / relative
@@ -255,16 +294,94 @@ def _copy_importer(worker: Path, root: Path, relative: str) -> None:
     destination.write_bytes((root / relative).read_bytes())
 
 
-def _overlay(worker: Path, root: Path, relative: str, original: bytes) -> None:
+def _overlay(
+    worker: Path, root: Path, relative: str, original: bytes, tracked: frozenset[str]
+) -> None:
     """Real directories along the source path. Every sibling is a link."""
 
     segments = tuple(relative.split("/"))
     for index, _segment in enumerate(segments[:-1]):
         rel_dir = Path(*segments[: index + 1])
-        _link_children(worker / rel_dir, root / rel_dir, {segments[index + 1]})
+        _link_children(worker / rel_dir, root / rel_dir, {segments[index + 1]}, root, tracked)
     destination = worker.joinpath(*segments)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(original)
+
+
+def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
+    """Validate bounded C# solution/project closure before copying or building."""
+
+    references: list[str] = []
+    if path.suffix.lower() == ".sln":
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        for match in re.findall(
+            r'Project\("[^"\n]+"\)\s*=\s*"[^"\n]*",\s*"([^"\n]+\.(?:csproj|fsproj|vbproj))"',
+            text,
+            re.IGNORECASE,
+        ):
+            references.append(match)
+    elif path.suffix.lower() in {".csproj", ".props", ".targets", ".slnx"}:
+        try:
+            xml_root = ET.parse(path).getroot()
+        except ET.ParseError as exc:
+            raise ValueError(f"Malformed MSBuild XML in {path}: {exc}") from exc
+        for item in xml_root.iter():
+            tag = item.tag.rsplit("}", 1)[-1]
+            if tag == "ProjectReference":
+                ref = item.get("Include")
+                if ref is not None:
+                    references.append(ref)
+            elif path.suffix.lower() == ".slnx" and tag == "Project":
+                ref = item.get("Path")
+                if ref is not None:
+                    references.append(ref)
+            elif tag in _ESCAPING_OUTPUT_TAGS and item.text and item.text.strip():
+                val = item.text.strip().replace("\\", "/")
+                if Path(val).is_absolute() or ".." in Path(val).parts:
+                    candidate = (path.parent / val).resolve()
+                    if not candidate.is_relative_to(root_resolved):
+                        raise ValueError(
+                            f"C# output path {val!r} in {path} escapes --root; "
+                            "worker isolation requires root-contained outputs"
+                        )
+    for ref in references:
+        lower = ref.lower()
+        if lower.endswith((".fsproj", ".vbproj")):
+            raise ValueError(f"Unsupported .NET project reference {ref!r} in {path}")
+        if any(token in ref for token in ("$(", "*", ";")):
+            raise ValueError(f"C# worker cannot resolve dynamic project reference {ref!r} in {path}")
+        target = (path.parent / ref.replace("\\", "/")).resolve()
+        if not target.is_relative_to(root_resolved):
+            raise ValueError(
+                f"Project reference leaves --root: {path} -> {ref}; "
+                "use a root containing the entire solution"
+            )
+
+
+def _copy_csharp(root: Path, worker: Path) -> None:
+    root_resolved = root.resolve()
+
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        skip = set(names) & _CSHARP_SKIP_COPY
+        for name in set(names) - skip:
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise ValueError(f"C# worker requires a self-contained tree; symlink: {path}")
+            if path.is_file() and path.suffix.lower() in {".sln", ".slnx", ".csproj", ".props", ".targets"}:
+                _validate_csharp_file(path, root_resolved)
+        return skip
+
+    shutil.copytree(root_resolved, worker, dirs_exist_ok=True, ignore=ignored)
+
+
+def _copy_powershell(root: Path, worker: Path) -> None:
+    root_resolved = root.resolve()
+
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        skip = set(names) & _POWERSHELL_SKIP_COPY
+        return skip
+
+    shutil.copytree(root_resolved, worker, dirs_exist_ok=True, ignore=ignored)
 
 
 def create_workers(
@@ -272,15 +389,30 @@ def create_workers(
 ) -> list[Path]:
     created = []
     first = relative.split("/", 1)[0]
-    importers = importers_of(root, relative)
+    lower_rel = relative.lower()
+    is_cs = lower_rel.endswith(".cs")
+    is_ps = lower_rel.endswith((".ps1", ".psm1"))
+    importers = set() if (is_cs or is_ps) else importers_of(root, relative)
+    tracked = frozenset() if (is_cs or is_ps) else tracked_directories(root)
     for index in range(count):
         worker = base / f"worker-{index}"
         worker.mkdir(parents=True, exist_ok=True)
-        _copy_configs(worker, root, relative)
-        _link_children(worker, root, {first})
-        _overlay(worker, root, relative, original)
-        for importer in importers:
-            _copy_importer(worker, root, importer)
+        if is_cs:
+            _copy_csharp(root, worker)
+            dest = worker / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(original)
+        elif is_ps:
+            _copy_powershell(root, worker)
+            dest = worker / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(original)
+        else:
+            _copy_configs(worker, root, relative)
+            _link_children(worker, root, {first}, root, tracked)
+            _overlay(worker, root, relative, original, tracked)
+            for importer in importers:
+                _copy_importer(worker, root, importer, tracked)
         created.append(worker)
     return created
 
@@ -291,6 +423,54 @@ def mapped_cwd(worker: Path, root: Path, cwd: Path) -> Path:
     except ValueError:
         return worker
     return (worker / relative).resolve()
+
+
+def _verify_worker_baseline(
+    directory: Path,
+    language: str | None,
+    runner,
+    command: Command,
+    root: Path,
+    cwd: Path,
+    target_rel: str | None,
+) -> tuple[bool, float, float, str]:
+    """Verify the unchanged worker passes its own baseline before mutating."""
+
+    if language == "csharp" and target_rel is not None:
+        restore_build = runner.run(
+            ["dotnet", "build", target_rel, "-c", "Debug", "--nologo"],
+            directory,
+            None,
+        )
+        if restore_build.code != 0:
+            return False, restore_build.seconds, 0.0, restore_build.output
+        test_res = runner.run(
+            [
+                "dotnet",
+                "test",
+                target_rel,
+                "-c",
+                "Debug",
+                "--no-build",
+                "--nologo",
+                "--filter",
+                "Category!=no-mutate",
+            ],
+            directory,
+            None,
+        )
+        if test_res.code != 0:
+            return False, restore_build.seconds, test_res.seconds, test_res.output
+        return True, restore_build.seconds, test_res.seconds, ""
+    if language == "powershell":
+        xml_path = directory / ".mutator-pester-baseline.xml"
+        from mutator.runner import _powershell_test_command, parse_nunit_outcome
+
+        res = runner.run(_powershell_test_command(directory, xml_path), directory, None)
+        if res.code != 0 or parse_nunit_outcome(xml_path) != "survived":
+            return False, 0.0, res.seconds, res.output
+        return True, 0.0, res.seconds, ""
+    return True, 0.0, 0.0, ""
 
 
 def _execute(
@@ -304,6 +484,9 @@ def _execute(
     cwd: Path,
     timeout: float,
     file_key: str,
+    language: str | None = None,
+    target_rel: str | None = None,
+    build_timeout: float = 60.0,
 ) -> str:
     current = original[site.start : site.end].decode("utf-8")
     if current != site.original:
@@ -311,11 +494,15 @@ def _execute(
             f"Skipped {file_key}:{site.line} {site.description}; source bytes moved",
             file=sys.stderr,
         )
-        return "survived"
+        return "error"
     destination = directory / relative
     mutated = apply_site(original.decode("utf-8"), site.start, site.end, site.mutant)
     destination.write_text(mutated, encoding="utf-8")
     try:
+        if language == "csharp" and target_rel is not None:
+            return execute_csharp_phased(runner, directory, target_rel, build_timeout, timeout)
+        if language == "powershell" and not isinstance(command, str):
+            return execute_powershell_phased(runner, directory, destination, timeout)
         result = runner.run(command, mapped_cwd(directory, root, cwd), timeout)
     finally:
         destination.write_bytes(original)
@@ -337,6 +524,9 @@ def _drain(
     cwd: Path,
     timeout: float,
     file_key: str,
+    language: str | None = None,
+    target_rel: str | None = None,
+    build_timeout: float = 60.0,
 ) -> None:
     while True:
         try:
@@ -357,6 +547,9 @@ def _drain(
             cwd,
             timeout,
             file_key,
+            language=language,
+            target_rel=target_rel,
+            build_timeout=build_timeout,
         )
         with lock:
             outcomes[site.mutation_id] = status
@@ -378,6 +571,9 @@ def _run_all(
     cwd: Path,
     timeout: float,
     file_key: str,
+    language: str | None = None,
+    target_rel: str | None = None,
+    build_timeout: float = 60.0,
 ) -> None:
     pending: Queue = Queue()
     for site in sites:
@@ -399,6 +595,9 @@ def _run_all(
                 cwd,
                 timeout,
                 file_key,
+                language,
+                target_rel,
+                build_timeout,
             )
             for directory in directories
         ]
@@ -418,17 +617,44 @@ def run_mutants(
     timeout: float,
     file_key: str,
     outcomes: dict[str, str],
-) -> None:
-    """Mutate ``sites`` in parallel overlays of ``root``. The source stays put."""
+    *,
+    language: str | None = None,
+    timeout_factor: float = 10.0,
+    custom_override: bool = False,
+) -> str | None:
+    """Mutate ``sites`` in parallel overlays of ``root``. The source stays put.
+
+    Returns an error message if a new-language per-worker baseline fails, else None.
+    """
 
     if not sites:
-        return
+        return None
     base = new_run_dir(root)
     try:
         relative = source.resolve().relative_to(root.resolve()).as_posix()
         directories = create_workers(
             base, root, relative, original, worker_count(len(sites), max_workers)
         )
+        target_rel: str | None = None
+        build_timeout = max(30.0, timeout)
+        effective_timeout = timeout
+        if language == "csharp" and not custom_override:
+            from mutator.crapper_link import ensure_crapper
+
+            target = ensure_crapper().runners.dotnet_target(root, [source])
+            target_rel = target.resolve().relative_to(root.resolve()).as_posix()
+        if language in {"csharp", "powershell"} and not custom_override:
+            for directory in directories:
+                ok, b_sec, t_sec, err = _verify_worker_baseline(
+                    directory, language, runner, command, root, cwd, target_rel
+                )
+                if not ok:
+                    tail = "\n".join(err.splitlines()[-20:])
+                    return f"Worker baseline failed for {file_key} in {directory.name}\n{tail}"
+                if b_sec > 0:
+                    build_timeout = max(build_timeout, b_sec * timeout_factor)
+                if t_sec > 0:
+                    effective_timeout = max(2.0, t_sec * timeout_factor)
         _run_all(
             directories,
             sites,
@@ -439,8 +665,12 @@ def run_mutants(
             runner,
             command,
             cwd,
-            timeout,
+            effective_timeout,
             file_key,
+            language=language if not custom_override else None,
+            target_rel=target_rel,
+            build_timeout=build_timeout,
         )
+        return None
     finally:
         delete_tree(base)

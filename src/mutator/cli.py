@@ -54,10 +54,10 @@ def _skipped_directory_text() -> str:
 HELP = f"""\
 Usage: mutator [options] [path-or-filter ...]
 
-Discover mutation sites in Clojure, Java, Go, TypeScript, Rust, and Python,
-run the project's tests against each one, and write `.metrics/mutate` for
-uml-viewer. Namespaces and function names are the ones crapper writes into
-`.metrics/crap.edn`.
+Discover mutation sites in Clojure, Java, Go, TypeScript/JavaScript, Rust,
+Python, C#, and PowerShell, run the project's tests against each one, and write
+`.metrics/mutate` for uml-viewer. Namespaces and function names are the ones
+crapper writes into `.metrics/crap.edn`.
 
 A form id is `defn/<name>` or, for a private operation, `defn-/<name>`.
 uml-viewer joins that name to the operation and joins `:namespace` to the
@@ -302,11 +302,13 @@ class GitStatusError(Exception):
 
 
 def _git(root: Path, *args: str) -> bytes:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     result = subprocess.run(
         ["git", "-C", os.fspath(root), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         message = os.fsdecode(result.stderr).strip() or "git status failed"
@@ -465,7 +467,7 @@ def _coverage_for(options: Options, root: Path, path: Path) -> set[int] | None:
     language = crapper.discover.language_of(path)
     if language is None:
         return None
-    return covered_lines(root, path, language)
+    return covered_lines(root, path, language, historical=options.use_existing_coverage)
 
 
 def _print_help(options: Options) -> int:
@@ -513,13 +515,15 @@ def _record(result, forms: list, written: list[str]) -> str:
     print(format_site_log(result.sites, result.statuses), end="")
     forms.extend(result.forms)
     written.extend(result.written)
+    if result.incomplete or any(form.incomplete for form in result.forms):
+        return "incomplete"
     if any(form.survived for form in result.forms):
         return "survived"
     return "ok"
 
 
-def _finish(baseline_failed: bool, survived: bool) -> int:
-    if baseline_failed:
+def _finish(baseline_failed: bool, survived: bool, incomplete: bool = False) -> int:
+    if baseline_failed or incomplete:
         return 2
     if survived:
         return 3
@@ -532,6 +536,7 @@ def _mutate_files(options: Options, root: Path, files: list[Path]) -> int:
     forms = []
     written: list[str] = []
     baseline_failed = False
+    incomplete = False
     survived = False
     for path in files:
         result = mutate_file(
@@ -551,13 +556,17 @@ def _mutate_files(options: Options, root: Path, files: list[Path]) -> int:
         outcome = _record(result, forms, written)
         if outcome == "baseline":
             baseline_failed = True
+        elif outcome == "incomplete":
+            incomplete = True
+            if any(form.survived for form in result.forms):
+                survived = True
         elif outcome == "survived":
             survived = True
     if forms:
         print(format_results(forms), end="")
     for path in written:
         print(f"Wrote {path}", file=sys.stderr)
-    return _finish(baseline_failed, survived)
+    return _finish(baseline_failed, survived, incomplete)
 
 
 def run(argv: list[str] | None = None) -> int:
