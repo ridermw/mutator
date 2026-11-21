@@ -253,6 +253,78 @@ def test_load_bundle_compat_with_legacy_crapper_signature(tmp_path):
     assert called == [tmp_path]
 
 
+def test_mutator_round2_fixes_dynamic_output_lines_incomplete_same_line_privacy_multi_trx_and_scan(tmp_path):
+    from mutator.engine import scan_file
+    from mutator.runner import parse_trx_directory
+
+    # 1. Dynamic MSBuild OutputPath is rejected
+    p_dyn = tmp_path / "dynout"
+    s_dyn = _write(p_dyn, "src/C.cs", "class C { int F(int x) => x + 1; }\n")
+    _write(
+        p_dyn,
+        "App.csproj",
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputPath>$(RepoRoot)out/</OutputPath></PropertyGroup></Project>\n',
+    )
+    b = new_run_dir(p_dyn)
+    try:
+        with pytest.raises(ValueError, match="Dynamic MSBuild output path"):
+            create_workers(b, p_dyn, "src/C.cs", s_dyn.read_bytes(), 1)
+    finally:
+        delete_tree(b)
+
+    # 2. Same-line class + private method uses byte-span signature, not class header
+    same_line = "namespace Demo;\npublic class C { private int Secret(int x) => x + 1; public int Open(int x) => x + 2; }\n"
+    p_sl = _write(tmp_path, "sl/C.cs", same_line)
+    sl_sites = sites_in_file(same_line, p_sl, tmp_path / "sl", "C.cs")
+    by_name = {s.name: s.form_id for s in sl_sites}
+    assert by_name["Secret"] == "defn-/Secret"
+    assert by_name["Open"] == "defn/Open"
+
+    # 3. --lines partial run marks form incomplete without incrementing errors for unselected sites
+    two_lines = "def f(x):\n    a = x > 0\n    return x + 1\n"
+    p_ln = _write(tmp_path, "ln/demo.py", two_lines)
+    ln_sites = sites_in_file(two_lines, p_ln, tmp_path / "ln", "demo.py")
+    covered = {s.mutation_id: True for s in ln_sites}
+    line2 = [s for s in ln_sites if s.line == 2]
+    outcomes = {s.mutation_id: "killed" for s in line2}
+    forms = _forms(two_lines, p_ln, tmp_path / "ln", "demo.py", ln_sites, covered, outcomes, {2})
+    assert forms[0].incomplete is True
+    assert forms[0].errors == 0
+
+    # 4. Multi-TRX aggregation catches kill in first report even if second report passed
+    trx_dir = tmp_path / "trxs"
+    trx_dir.mkdir()
+    (trx_dir / "a.trx").write_text('<TestRun><ResultSummary><Counters executed="1" failed="1" error="0" timeout="0"/></ResultSummary></TestRun>')
+    (trx_dir / "b.trx").write_text('<TestRun><ResultSummary><Counters executed="1" failed="0" error="0" timeout="0"/></ResultSummary></TestRun>')
+    assert parse_trx_directory(trx_dir) == "killed"
+
+    # 5. scan_file does not mark unchanged C# function as changed after versioned run
+    cs_root = tmp_path / "csscan"
+    cs_src = "namespace Demo;\npublic class C { public int F(int x) => x + 1; }\n"
+    cs_path = _write(cs_root, "src/C.cs", cs_src)
+    cs_sites = sites_in_file(cs_src, cs_path, cs_root, "src/C.cs")
+    cs_forms = _forms(cs_src, cs_path, cs_root, "src/C.cs", cs_sites, {s.mutation_id: True for s in cs_sites}, {s.mutation_id: "killed" for s in cs_sites}, None)
+    write_results(cs_root, "src/C.cs", cs_forms, {s.mutation_id: "killed" for s in cs_sites}, classifier_version=CLASSIFIER_VERSION)
+    scan_out = scan_file(cs_path, cs_root, covered_lines=None, ignore_coverage=True, lines=None)
+    assert "* marks a function" not in scan_out
+
+    # 6. Custom --test-command override on C# must NOT stamp classifier-version 2
+    class FakePass:
+        verbose = False
+
+        def run(self, command, cwd, timeout):
+            return CommandResult(code=1 if timeout else 0, timed_out=False, seconds=0.01, output="")
+
+    cs_ov = tmp_path / "csov"
+    ov_path = _write(cs_ov, "src/C.cs", cs_src)
+    mutate_file(
+        ov_path, cs_ov, runner=FakePass(), covered_lines=None, ignore_coverage=True,
+        mutate_all=True, lines=None, test_command="fake-override", timeout_factor=10,
+        mutation_warning=50, baselines={}, max_workers=1,
+    )
+    assert load_history(cs_ov, "src/C.cs").classifier_versions == {}
+
+
 @pytest.mark.skipif(not shutil.which("pwsh"), reason="pwsh not installed")
 def test_powershell_live_mutation_isolated_worker(tmp_path):
     src_text = """\

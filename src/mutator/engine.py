@@ -137,8 +137,12 @@ def _tally_sites(
         elif status == "error":
             errors += 1
             incomplete = True
-        elif lines is None:
-            # Unknown or missing status on a covered site is an error, never a survivor.
+        elif lines is not None and site.line not in lines:
+            # Intentionally unselected by --lines: not an execution error, but the
+            # form's full mutation picture is incomplete.
+            incomplete = True
+        else:
+            # Missing or unknown status on an expected site is an error, never a survivor.
             errors += 1
             incomplete = True
     return killed, survived, uncovered, invalid, errors, incomplete
@@ -416,7 +420,12 @@ def mutate_file(
         return failure
     forms = _forms(source, path, root, file_key, found, covered, outcomes, lines)
     incomplete = any(form.incomplete for form in forms)
-    classifier_version = CLASSIFIER_VERSION if language in _VERSIONED_LANGUAGES else None
+    # Only stamp phased classifier version when phased execution actually ran (never custom overrides).
+    classifier_version = (
+        CLASSIFIER_VERSION
+        if (language in _VERSIONED_LANGUAGES and not test_command)
+        else None
+    )
     written = write_results(root, file_key, forms, outcomes, classifier_version=classifier_version)
     return RunResult(
         path=file_key,
@@ -450,10 +459,19 @@ def scan_file(
         found = [site for site in found if site.line in lines]
     covered = _coverage_map(found, covered_lines, ignore_coverage)
     history = load_history(root, file_key)
-    digests = form_digests(source, path, root)
-    changed = {
-        key
-        for key, value in digests.items()
-        if key not in history.forms or history.forms[key].digest != value
-    }
+    crapper = ensure_crapper()
+    language = crapper.discover.language_of(path)
+    if language in _VERSIONED_LANGUAGES:
+        changed = set()
+        for ns, fid, _s, _e, _nm, _pr, dg, ordinal in form_declarations(source, path, root):
+            prior = history.declaration_forms.get((ns, fid, ordinal))
+            if prior is None or prior.digest != dg:
+                changed.add((ns, fid))
+    else:
+        digests = form_digests(source, path, root)
+        changed = {
+            key
+            for key, value in digests.items()
+            if key not in history.forms or history.forms[key].digest != value
+        }
     return format_scan(file_key, found, changed, None if ignore_coverage else covered)

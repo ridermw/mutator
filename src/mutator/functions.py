@@ -68,10 +68,20 @@ def _powershell_static_exports(source: str) -> set[str] | None:
     return exported or None
 
 
-def _declaration_prefix(source: str, start: int, end: int) -> str:
-    """Text before the parameter list or body (`(`, `{`, `=>`), never body strings."""
+def _declaration_prefix(
+    source: str, start: int, end: int, start_byte: int = -1, end_byte: int = -1
+) -> str:
+    """Text before the parameter list or body (`(`, `{`, `=>`), never body strings.
 
-    text = _header(source, start, end)
+    When `start_byte`/`end_byte` are present, slices the exact parsed declaration
+    so same-line enclosing types or sibling methods cannot bleed into the prefix.
+    """
+
+    if start_byte >= 0 and end_byte > start_byte:
+        raw = source.encode("utf-8")[start_byte:end_byte].decode("utf-8", errors="replace").lstrip()
+    else:
+        raw = _header(source, start, end)
+    text = raw
     # Strip leading C# attributes `[Attr(...)]`
     while text.startswith("["):
         close = text.find("]")
@@ -85,22 +95,31 @@ def _declaration_prefix(source: str, start: int, end: int) -> str:
     return text
 
 
-def is_private(language: str, name: str, source: str, start: int, end: int) -> bool:
+def is_private(
+    language: str,
+    name: str,
+    source: str,
+    start: int,
+    end: int,
+    start_byte: int = -1,
+    end_byte: int = -1,
+) -> bool:
     """True when uml-viewer should treat the operation as private."""
 
     header = _header(source, start, end)
     if language == "clojure":
         return bool(re.match(r"\(defn-", header))
     if language == "csharp":
-        # Check only modifiers in the declaration signature, never body text or strings.
-        prefix = _declaration_prefix(source, start, end)
+        prefix = _declaration_prefix(source, start, end, start_byte, end_byte)
         if re.search(r"\bprivate\b", prefix):
             return True
         return not re.search(r"\b(public|protected|internal)\b", prefix)
     if language == "powershell":
-        # `hidden` is only a leading modifier on class member declarations, never body text.
-        first_line = _lines(source)[start - 1].lstrip() if start - 1 < len(_lines(source)) else ""
-        sig = first_line.split("{", 1)[0].split("(", 1)[0]
+        if start_byte >= 0 and end_byte > start_byte:
+            sig_src = source.encode("utf-8")[start_byte:end_byte].decode("utf-8", errors="replace").lstrip()
+        else:
+            sig_src = _lines(source)[start - 1].lstrip() if start - 1 < len(_lines(source)) else ""
+        sig = sig_src.split("{", 1)[0].split("(", 1)[0]
         if re.match(r"^hidden\b", sig, re.IGNORECASE):
             return True
         exports = _powershell_static_exports(source)
@@ -234,7 +253,16 @@ def sites_in_file(source: str, path: Path, root: Path, file_key: str) -> list[Si
         return []
     functions = project_functions(source, path, root)
     privacy = {
-        id(fn): is_private(language, fn.name, source, fn.start_line, fn.end_line) for fn in functions
+        id(fn): is_private(
+            language,
+            fn.name,
+            source,
+            fn.start_line,
+            fn.end_line,
+            getattr(fn, "start_byte", -1),
+            getattr(fn, "end_byte", -1),
+        )
+        for fn in functions
     }
     ordinals = _ordinals(functions, privacy)
     line_starts = _line_starts(source)
@@ -285,7 +313,15 @@ def form_digests(source: str, path: Path, root: Path) -> dict[tuple[str, str], s
         return {}
     grouped: dict[tuple[str, str], list] = {}
     for fn in project_functions(source, path, root):
-        private = is_private(language, fn.name, source, fn.start_line, fn.end_line)
+        private = is_private(
+            language,
+            fn.name,
+            source,
+            fn.start_line,
+            fn.end_line,
+            getattr(fn, "start_byte", -1),
+            getattr(fn, "end_byte", -1),
+        )
         key = (fn.namespace, form_id(fn.name, private))
         grouped.setdefault(key, []).append(fn)
     digests = {}
@@ -303,7 +339,15 @@ def form_spans(source: str, path: Path, root: Path) -> dict[tuple[str, str], tup
     language = crapper.discover.language_of(path)
     spans = {}
     for fn in project_functions(source, path, root):
-        private = is_private(language or "", fn.name, source, fn.start_line, fn.end_line)
+        private = is_private(
+            language or "",
+            fn.name,
+            source,
+            fn.start_line,
+            fn.end_line,
+            getattr(fn, "start_byte", -1),
+            getattr(fn, "end_byte", -1),
+        )
         key = (fn.namespace, form_id(fn.name, private))
         if key not in spans:
             spans[key] = (fn.start_line, fn.end_line, fn.name, private)
@@ -325,7 +369,15 @@ def form_declarations(
     seen: dict[tuple[str, str], int] = {}
     declarations = []
     for fn in functions:
-        private = is_private(language, fn.name, source, fn.start_line, fn.end_line)
+        private = is_private(
+            language,
+            fn.name,
+            source,
+            fn.start_line,
+            fn.end_line,
+            getattr(fn, "start_byte", -1),
+            getattr(fn, "end_byte", -1),
+        )
         fid = form_id(fn.name, private)
         key = (fn.namespace, fid)
         ordinal = seen.get(key, 0)

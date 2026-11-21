@@ -367,6 +367,49 @@ def parse_nunit_outcome(xml_path: Path) -> str:
     return "survived"
 
 
+def parse_trx_directory(trx_dir: Path) -> str:
+    """Aggregate all VSTest .trx reports in `trx_dir` into 'killed', 'survived', or 'error'."""
+
+    import xml.etree.ElementTree as ET
+
+    if not trx_dir.is_dir():
+        return "error"
+    trx_files = sorted(trx_dir.rglob("*.trx"))
+    if not trx_files:
+        return "error"
+    total_executed = total_failed = total_errors = total_timeouts = 0
+    for trx_path in trx_files:
+        try:
+            root = ET.parse(trx_path).getroot()
+        except (OSError, ET.ParseError):
+            return "error"
+        counters = None
+        for elem in root.iter():
+            if elem.tag.rpartition("}")[2] == "Counters":
+                counters = elem
+                break
+        if counters is None:
+            return "error"
+        try:
+            executed = int(counters.get("executed", "0"))
+            failed = int(counters.get("failed", "0"))
+            errors = int(counters.get("error", "0"))
+            timeout_count = int(counters.get("timeout", "0"))
+        except ValueError:
+            return "error"
+        total_executed += executed
+        total_failed += failed
+        total_errors += errors
+        total_timeouts += timeout_count
+    if total_executed <= 0:
+        return "error"
+    if total_failed > 0 or total_timeouts > 0:
+        return "killed"
+    if total_errors > 0:
+        return "error"
+    return "survived"
+
+
 def execute_csharp_phased(
     runner: CommandRunner,
     worker: Path,
@@ -375,7 +418,7 @@ def execute_csharp_phased(
     test_timeout: float,
 ) -> str:
     """Phased C# mutant execution: build first (compiler errors -> invalid),
-    then test with TRX structured evidence (failed tests -> killed, passing -> survived)."""
+    then test with per-project/TFM TRX structured evidence."""
 
     import re
 
@@ -396,7 +439,6 @@ def execute_csharp_phased(
         import shutil
         shutil.rmtree(trx_dir, ignore_errors=True)
     trx_dir.mkdir(parents=True, exist_ok=True)
-    trx_file = trx_dir / "results.trx"
 
     test_res = runner.run(
         [
@@ -410,7 +452,7 @@ def execute_csharp_phased(
             "--filter",
             "Category!=no-mutate",
             "--logger",
-            f"trx;LogFileName={trx_file.name}",
+            "trx",
             "--results-directory",
             str(trx_dir),
         ],
@@ -419,7 +461,7 @@ def execute_csharp_phased(
     )
     if test_res.timed_out:
         return "killed"
-    outcome = parse_trx_outcome(trx_file)
+    outcome = parse_trx_directory(trx_dir)
     if outcome == "survived" and test_res.code != 0:
         return "error"
     return outcome

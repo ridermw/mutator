@@ -55,8 +55,8 @@ _POWERSHELL_SKIP_COPY = SKIP_LINK | {".worktrees", "node_modules"}
 _ESCAPING_OUTPUT_TAGS = {"OutputPath", "BaseOutputPath", "BaseIntermediateOutputPath", "IntermediateOutputPath"}
 
 
-def tracked_directories(root: Path) -> frozenset[str]:
-    """Directories under root that hold files git tracks, relative to root."""
+def tracked_files(root: Path) -> frozenset[str]:
+    """Files under root that git tracks, as POSIX paths relative to root."""
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
@@ -65,13 +65,39 @@ def tracked_directories(root: Path) -> frozenset[str]:
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return frozenset()
+    return frozenset(
+        name for name in listed.decode("utf-8", "surrogateescape").split("\0") if name
+    )
+
+
+def tracked_directories(root: Path) -> frozenset[str]:
+    """Directories under root that hold files git tracks, relative to root."""
+
     found = set()
-    for name in listed.decode("utf-8", "surrogateescape").split("\0"):
+    for name in tracked_files(root):
         parent = PurePosixPath(name).parent
         while parent != PurePosixPath("."):
             found.add(parent.as_posix())
             parent = parent.parent
     return frozenset(found)
+
+
+def _copy_tracked_output_dir(worker_dir: Path, child: Path, root: Path, files: frozenset[str]) -> None:
+    """Copy only git-tracked files from an output-named directory into the worker,
+    keeping untracked build artifacts isolated and preventing writes into the original tree."""
+
+    prefix = child.relative_to(root).as_posix() + "/"
+    dest_root = worker_dir / child.name
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for rel in files:
+        if not rel.startswith(prefix):
+            continue
+        src = root / rel
+        if not src.is_file():
+            continue
+        dst = dest_root / rel[len(prefix) :]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
 
 
 def _skipped(child: Path, root: Path, tracked: frozenset[str]) -> bool:
@@ -157,7 +183,12 @@ def _copy_configs(worker: Path, root: Path, relative: str) -> None:
 
 
 def _link_children(
-    worker_dir: Path, real_dir: Path, skip: set[str], root: Path, tracked: frozenset[str]
+    worker_dir: Path,
+    real_dir: Path,
+    skip: set[str],
+    root: Path,
+    tracked: frozenset[str],
+    tracked_all: frozenset[str] = frozenset(),
 ) -> None:
     if not real_dir.is_dir():
         return
@@ -166,6 +197,9 @@ def _link_children(
             continue
         destination = worker_dir / child.name
         if destination.exists() or destination.is_symlink():
+            continue
+        if child.is_dir() and child.name in OUTPUT_DIRS and tracked_all:
+            _copy_tracked_output_dir(worker_dir, child, root, tracked_all)
             continue
         symlink(destination, child)
 
@@ -295,14 +329,21 @@ def _copy_importer(worker: Path, root: Path, relative: str, tracked: frozenset[s
 
 
 def _overlay(
-    worker: Path, root: Path, relative: str, original: bytes, tracked: frozenset[str]
+    worker: Path,
+    root: Path,
+    relative: str,
+    original: bytes,
+    tracked: frozenset[str],
+    tracked_all: frozenset[str] = frozenset(),
 ) -> None:
     """Real directories along the source path. Every sibling is a link."""
 
     segments = tuple(relative.split("/"))
     for index, _segment in enumerate(segments[:-1]):
         rel_dir = Path(*segments[: index + 1])
-        _link_children(worker / rel_dir, root / rel_dir, {segments[index + 1]}, root, tracked)
+        _link_children(
+            worker / rel_dir, root / rel_dir, {segments[index + 1]}, root, tracked, tracked_all
+        )
     destination = worker.joinpath(*segments)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(original)
@@ -337,6 +378,10 @@ def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
                     references.append(ref)
             elif tag in _ESCAPING_OUTPUT_TAGS and item.text and item.text.strip():
                 raw_val = item.text.strip()
+                if any(tok in raw_val for tok in ("$(", "@(", "%(")):
+                    raise ValueError(
+                        f"Dynamic MSBuild output path {raw_val!r} in {path} cannot be verified for worker isolation"
+                    )
                 val = raw_val.replace("\\", "/")
                 from pathlib import PureWindowsPath
 
@@ -408,6 +453,7 @@ def create_workers(
     is_cs = lower_rel.endswith(".cs")
     is_ps = lower_rel.endswith((".ps1", ".psm1"))
     importers = set() if (is_cs or is_ps) else importers_of(root, relative)
+    tracked_all = frozenset() if (is_cs or is_ps) else tracked_files(root)
     tracked = frozenset() if (is_cs or is_ps) else tracked_directories(root)
     for index in range(count):
         worker = base / f"worker-{index}"
@@ -424,8 +470,8 @@ def create_workers(
             dest.write_bytes(original)
         else:
             _copy_configs(worker, root, relative)
-            _link_children(worker, root, {first}, root, tracked)
-            _overlay(worker, root, relative, original, tracked)
+            _link_children(worker, root, {first}, root, tracked, tracked_all)
+            _overlay(worker, root, relative, original, tracked, tracked_all)
             for importer in importers:
                 _copy_importer(worker, root, importer, tracked)
         created.append(worker)
