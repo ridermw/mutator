@@ -68,6 +68,23 @@ def _powershell_static_exports(source: str) -> set[str] | None:
     return exported or None
 
 
+def _declaration_prefix(source: str, start: int, end: int) -> str:
+    """Text before the parameter list or body (`(`, `{`, `=>`), never body strings."""
+
+    text = _header(source, start, end)
+    # Strip leading C# attributes `[Attr(...)]`
+    while text.startswith("["):
+        close = text.find("]")
+        if close < 0:
+            break
+        text = text[close + 1 :].lstrip()
+    for stop in ("(", "{", "=>"):
+        idx = text.find(stop)
+        if idx >= 0:
+            text = text[:idx]
+    return text
+
+
 def is_private(language: str, name: str, source: str, start: int, end: int) -> bool:
     """True when uml-viewer should treat the operation as private."""
 
@@ -75,11 +92,16 @@ def is_private(language: str, name: str, source: str, start: int, end: int) -> b
     if language == "clojure":
         return bool(re.match(r"\(defn-", header))
     if language == "csharp":
-        if re.search(r"\bprivate\b", header):
+        # Check only modifiers in the declaration signature, never body text or strings.
+        prefix = _declaration_prefix(source, start, end)
+        if re.search(r"\bprivate\b", prefix):
             return True
-        return not re.search(r"\b(public|protected|internal)\b", header)
+        return not re.search(r"\b(public|protected|internal)\b", prefix)
     if language == "powershell":
-        if re.search(r"\bhidden\b", header, re.IGNORECASE):
+        # `hidden` is only a leading modifier on class member declarations, never body text.
+        first_line = _lines(source)[start - 1].lstrip() if start - 1 < len(_lines(source)) else ""
+        sig = first_line.split("{", 1)[0].split("(", 1)[0]
+        if re.match(r"^hidden\b", sig, re.IGNORECASE):
             return True
         exports = _powershell_static_exports(source)
         if exports is not None and name.lower() not in exports:
@@ -198,7 +220,7 @@ def _ordinals(functions, privacy: dict[int, bool]) -> dict[int, int]:
 
     seen: dict[tuple[str, str], int] = {}
     ordinals = {}
-    for fn in sorted(functions, key=lambda fn: (fn.start_line, fn.end_line)):
+    for fn in sorted(functions, key=lambda fn: (fn.start_line, fn.end_line, getattr(fn, "start_byte", -1))):
         key = (fn.namespace, form_id(fn.name, privacy[id(fn)]))
         ordinals[id(fn)] = seen.get(key, 0)
         seen[key] = ordinals[id(fn)] + 1
@@ -248,6 +270,7 @@ def sites_in_file(source: str, path: Path, root: Path, file_key: str) -> list[Si
                 ),
                 anchor_line=raw.anchor_line,
                 form_line=owner.start_line,
+                form_ordinal=ordinals[id(owner)],
             )
         )
     return found
@@ -290,23 +313,31 @@ def form_spans(source: str, path: Path, root: Path) -> dict[tuple[str, str], tup
     return spans
 
 
-def form_declarations(source: str, path: Path, root: Path) -> list[tuple[str, str, int, int, str, bool, str]]:
-    """Every distinct declaration in source order: `(namespace, form_id, start, end, name, private, digest)`."""
+def form_declarations(
+    source: str, path: Path, root: Path
+) -> list[tuple[str, str, int, int, str, bool, str, int]]:
+    """Every distinct declaration in source order:
+    `(namespace, form_id, start, end, name, private, digest, ordinal)`."""
 
     crapper = ensure_crapper()
     language = crapper.discover.language_of(path) or ""
+    functions = sorted(project_functions(source, path, root), key=lambda f: (f.start_line, f.end_line, getattr(f, "start_byte", -1)))
+    seen: dict[tuple[str, str], int] = {}
     declarations = []
-    for fn in sorted(project_functions(source, path, root), key=lambda f: (f.start_line, f.end_line)):
+    for fn in functions:
         private = is_private(language, fn.name, source, fn.start_line, fn.end_line)
+        fid = form_id(fn.name, private)
+        key = (fn.namespace, fid)
+        ordinal = seen.get(key, 0)
+        seen[key] = ordinal + 1
+        start_b = getattr(fn, "start_byte", -1)
+        end_b = getattr(fn, "end_byte", -1)
+        if start_b >= 0 and end_b > start_b:
+            chunk = source.encode("utf-8")[start_b:end_b].decode("utf-8", errors="replace")
+            dg = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        else:
+            dg = digest(source, fn.start_line, fn.end_line)
         declarations.append(
-            (
-                fn.namespace,
-                form_id(fn.name, private),
-                fn.start_line,
-                fn.end_line,
-                fn.name,
-                private,
-                digest(source, fn.start_line, fn.end_line),
-            )
+            (fn.namespace, fid, fn.start_line, fn.end_line, fn.name, private, dg, ordinal)
         )
     return declarations

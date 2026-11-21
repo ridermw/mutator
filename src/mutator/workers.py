@@ -336,21 +336,36 @@ def _validate_csharp_file(path: Path, root_resolved: Path) -> None:
                 if ref is not None:
                     references.append(ref)
             elif tag in _ESCAPING_OUTPUT_TAGS and item.text and item.text.strip():
-                val = item.text.strip().replace("\\", "/")
-                if Path(val).is_absolute() or ".." in Path(val).parts:
+                raw_val = item.text.strip()
+                val = raw_val.replace("\\", "/")
+                from pathlib import PureWindowsPath
+
+                if Path(val).is_absolute() or PureWindowsPath(raw_val).is_absolute():
+                    raise ValueError(
+                        f"Absolute C# output path {raw_val!r} in {path} is not isolated per worker"
+                    )
+                if ".." in Path(val).parts:
                     candidate = (path.parent / val).resolve()
                     if not candidate.is_relative_to(root_resolved):
                         raise ValueError(
-                            f"C# output path {val!r} in {path} escapes --root; "
+                            f"C# output path {raw_val!r} in {path} escapes --root; "
                             "worker isolation requires root-contained outputs"
                         )
     for ref in references:
+        from pathlib import PureWindowsPath
+
         lower = ref.lower()
         if lower.endswith((".fsproj", ".vbproj")):
             raise ValueError(f"Unsupported .NET project reference {ref!r} in {path}")
         if any(token in ref for token in ("$(", "*", ";")):
             raise ValueError(f"C# worker cannot resolve dynamic project reference {ref!r} in {path}")
-        target = (path.parent / ref.replace("\\", "/")).resolve()
+        norm_ref = ref.replace("\\", "/")
+        if Path(norm_ref).is_absolute() or PureWindowsPath(ref).is_absolute():
+            raise ValueError(
+                f"Absolute project reference {ref!r} in {path} would build the original tree; "
+                "use a relative path"
+            )
+        target = (path.parent / norm_ref).resolve()
         if not target.is_relative_to(root_resolved):
             raise ValueError(
                 f"Project reference leaves --root: {path} -> {ref}; "
@@ -644,6 +659,7 @@ def run_mutants(
             target = ensure_crapper().runners.dotnet_target(root, [source])
             target_rel = target.resolve().relative_to(root.resolve()).as_posix()
         if language in {"csharp", "powershell"} and not custom_override:
+            max_test_timeout = 2.0
             for directory in directories:
                 ok, b_sec, t_sec, err = _verify_worker_baseline(
                     directory, language, runner, command, root, cwd, target_rel
@@ -654,7 +670,8 @@ def run_mutants(
                 if b_sec > 0:
                     build_timeout = max(build_timeout, b_sec * timeout_factor)
                 if t_sec > 0:
-                    effective_timeout = max(2.0, t_sec * timeout_factor)
+                    max_test_timeout = max(max_test_timeout, t_sec * timeout_factor)
+            effective_timeout = max_test_timeout
         _run_all(
             directories,
             sites,

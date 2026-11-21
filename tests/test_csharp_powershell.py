@@ -169,6 +169,89 @@ def test_csharp_worker_containment_rejects_fsproj_symlinks_and_escaping_paths(tm
     with pytest.raises(ValueError, match="relative .NET project paths"):
         build_test_plan(proj, src, "csharp", f"dotnet test {proj}/App.sln")
 
+    # Reject absolute ProjectReference and absolute OutputPath even when inside --root
+    proj2 = tmp_path / "absrepo"
+    src2 = _write(proj2, "src/Calc.cs", "class Calc { int F(int x) => x + 1; }\n")
+    _write(
+        proj2,
+        "App.csproj",
+        f'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputPath>{proj2}/out</OutputPath></PropertyGroup></Project>\n',
+    )
+    base2 = new_run_dir(proj2)
+    try:
+        with pytest.raises(ValueError, match="Absolute C# output path"):
+            create_workers(base2, proj2, "src/Calc.cs", src2.read_bytes(), 1)
+    finally:
+        delete_tree(base2)
+
+    proj3 = tmp_path / "absref"
+    src3 = _write(proj3, "src/Calc.cs", "class Calc { int F(int x) => x + 1; }\n")
+    _write(
+        proj3,
+        "App.csproj",
+        f'<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="{proj3}/Lib.csproj" /></ItemGroup></Project>\n',
+    )
+    base3 = new_run_dir(proj3)
+    try:
+        with pytest.raises(ValueError, match="Absolute project reference"):
+            create_workers(base3, proj3, "src/Calc.cs", src3.read_bytes(), 1)
+    finally:
+        delete_tree(base3)
+
+
+def test_same_line_csharp_overloads_privacy_body_strings_and_per_file_classifier_versions(tmp_path):
+    # Two overloads on the same line keep distinct ordinals and sites without double counting
+    src = 'namespace Demo;\npublic class C { public string M(int a) => a > 0 ? "private" : "ok"; public int M(long b) => b < 1 ? 1 : 0; }\n'
+    p = _write(tmp_path, "src/C.cs", src)
+    sites = sites_in_file(src, p, tmp_path, "src/C.cs")
+    assert {s.form_ordinal for s in sites} == {0, 1}
+    assert not is_private("csharp", "M", src, 2, 2)
+    ps_src = "function Get-Msg { return 'hidden' }\n"
+    assert not is_private("powershell", "Get-Msg", ps_src, 1, 1)
+
+    covered = {s.mutation_id: True for s in sites}
+    outcomes = {s.mutation_id: "killed" for s in sites}
+    forms = _forms(src, p, tmp_path, "src/C.cs", sites, covered, outcomes, None)
+    assert len(forms) == 2
+    assert sum(f.killed for f in forms) == len(sites)
+
+    # Differential cache hits on unchanged declaration without rerunning
+    write_results(tmp_path, "src/C.cs", forms, outcomes, classifier_version=CLASSIFIER_VERSION)
+    hist = load_history(tmp_path, "src/C.cs")
+    from mutator.functions import form_declarations
+
+    digests = {(ns, fid, ord_): dg for ns, fid, _s, _e, _nm, _pr, dg, ord_ in form_declarations(src, p, tmp_path)}
+    assert _select(sites, covered, hist, digests, False, None, language="csharp") == []
+
+    # Writing an untouched namespace preserves its classifier-version, and legacy partial file stays unversioned
+    other_path = snapshot_path(tmp_path, "Demo.Other")
+    other_path.parent.mkdir(parents=True, exist_ok=True)
+    other_path.write_text(
+        dumps({"version": 1, "source": "src/Other.cs", "namespace": "Demo.Other", "classifier-version": 2, "outcomes": {}, "forms": [{"id": "defn/X", "file": "src/Other.cs", "line": 1, "hash": "h"}]}) + "\n",
+        encoding="utf-8",
+    )
+    # Add a legacy (unversioned) partial file to Demo.C before rewriting src/C.cs
+    legacy_c = loads(snapshot_path(tmp_path, "Demo.C").read_text(encoding="utf-8"))
+    legacy_c["forms"].append({"id": "defn/Old", "file": "src/C.Part.cs", "line": 1, "hash": "h0", "killed": 1, "survived": 0, "uncovered": 0, "sites": 1})
+    legacy_c.pop("classifier-version", None)
+    legacy_c["classifier-versions"] = {"src/C.cs": 2}
+    snapshot_path(tmp_path, "Demo.C").write_text(dumps(legacy_c) + "\n", encoding="utf-8")
+
+    write_results(tmp_path, "src/C.cs", forms, outcomes, classifier_version=CLASSIFIER_VERSION)
+    assert load_history(tmp_path, "src/Other.cs").classifier_versions.get("Demo.Other") == 2
+    assert load_history(tmp_path, "src/C.Part.cs").classifier_versions.get("Demo.C") is None
+    assert load_history(tmp_path, "src/C.cs").classifier_versions.get("Demo.C") == 2
+
+
+def test_load_bundle_compat_with_legacy_crapper_signature(tmp_path):
+    from types import SimpleNamespace
+    from mutator.coverage import _load_bundle
+
+    called = []
+    legacy_crapper = SimpleNamespace(coverage=SimpleNamespace(load_bundle=lambda root: called.append(root) or "ok"))
+    assert _load_bundle(legacy_crapper, tmp_path, historical=True) == "ok"
+    assert called == [tmp_path]
+
 
 @pytest.mark.skipif(not shutil.which("pwsh"), reason="pwsh not installed")
 def test_powershell_live_mutation_isolated_worker(tmp_path):

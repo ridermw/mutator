@@ -209,6 +209,19 @@ def _go_lines(profile, source_path: str) -> set[int] | None:
     return covered
 
 
+def _load_bundle(crapper, root: Path, historical: bool):
+    import inspect
+
+    loader = crapper.coverage.load_bundle
+    try:
+        params = inspect.signature(loader).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "historical" in params:
+        return loader(root, historical=historical)
+    return loader(root)
+
+
 def covered_lines(
     root: Path, source_path: Path, language: str, *, historical: bool = False
 ) -> set[int] | None:
@@ -218,7 +231,7 @@ def covered_lines(
     path = source_path.resolve().as_posix()
     if language == "java":
         return _lookup(_jacoco_index(root), path)
-    bundle = crapper.coverage.load_bundle(root, historical=historical)
+    bundle = _load_bundle(crapper, root, historical)
     if language == "go":
         return _go_lines(bundle.go_profile, path)
     if language == "clojure":

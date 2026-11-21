@@ -22,8 +22,9 @@ class Site:
     mutation_id: str
     # The line its statement starts on; coverage on that line counts for the site.
     anchor_line: int = 0
-    # Distinguishes same-name overloads in the same file/namespace.
+    # Distinguishes same-name overloads in the same file/namespace (even on one line).
     form_line: int = 0
+    form_ordinal: int = 0
 
     @property
     def description(self) -> str:
@@ -51,6 +52,7 @@ class FormResult:
     invalid: int = 0
     errors: int = 0
     incomplete: bool = False
+    ordinal: int | None = None
 
     @property
     def score(self) -> float | None:
@@ -67,6 +69,7 @@ class PriorForm:
     digest: str
     file: str
     line: int = 0
+    ordinal: int | None = None
 
 
 @dataclass
@@ -74,6 +77,7 @@ class History:
     """Previous results for one source file, used for differential runs."""
 
     forms: dict[tuple[str, str], PriorForm] = field(default_factory=dict)
+    declaration_forms: dict[tuple[str, str, int], PriorForm] = field(default_factory=dict)
     outcomes: dict[str, str] = field(default_factory=dict)
     classifier_versions: dict[str, int] = field(default_factory=dict)
 

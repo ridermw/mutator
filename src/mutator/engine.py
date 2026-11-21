@@ -57,11 +57,22 @@ def _cache_valid(history, namespace: str, language: str | None) -> bool:
     return True
 
 
+def _is_unchanged(site: Site, history, digests: dict, language: str | None) -> bool:
+    if language in _VERSIONED_LANGUAGES:
+        dkey = (site.namespace, site.form_id, site.form_ordinal)
+        prior = history.declaration_forms.get(dkey)
+        if prior is not None and dkey in digests:
+            return prior.digest == digests[dkey]
+    key = (site.namespace, site.form_id)
+    prior = history.forms.get(key)
+    return prior is not None and prior.digest == digests.get(key)
+
+
 def _select(
     sites: list[Site],
     covered: dict[str, bool],
     history,
-    digests: dict[tuple[str, str], str],
+    digests: dict,
     mutate_all: bool,
     lines: set[int] | None,
     language: str | None = None,
@@ -72,9 +83,7 @@ def _select(
             continue
         if lines is not None and site.line not in lines:
             continue
-        key = (site.namespace, site.form_id)
-        prior = history.forms.get(key)
-        unchanged = prior is not None and prior.digest == digests.get(key)
+        unchanged = _is_unchanged(site, history, digests, language)
         if mutate_all or not unchanged:
             chosen.append(site)
             continue
@@ -91,7 +100,7 @@ def _carry_forward(
     sites: list[Site],
     covered: dict[str, bool],
     history,
-    digests,
+    digests: dict,
     language: str | None = None,
 ) -> dict[str, str]:
     by_id = {site.mutation_id: site for site in sites}
@@ -104,9 +113,7 @@ def _carry_forward(
             continue
         if status not in {"killed", "survived"}:
             continue
-        key = (site.namespace, site.form_id)
-        prior = history.forms.get(key)
-        if prior is not None and prior.digest == digests.get(key):
+        if _is_unchanged(site, history, digests, language):
             carried[mutation] = status
     return carried
 
@@ -153,10 +160,10 @@ def _forms(
         declarations = form_declarations(source, path, root)
         grouped_decl: dict[tuple[str, str, int], list[Site]] = {}
         for site in sites:
-            grouped_decl.setdefault((site.namespace, site.form_id, site.form_line), []).append(site)
+            grouped_decl.setdefault((site.namespace, site.form_id, site.form_ordinal), []).append(site)
         forms = []
-        for namespace, form, start, end, name, private, dg in declarations:
-            owned = grouped_decl.get((namespace, form, start), [])
+        for namespace, form, start, end, name, private, dg, ordinal in declarations:
+            owned = grouped_decl.get((namespace, form, ordinal), [])
             killed, survived, uncovered, invalid, errors, incomplete = _tally_sites(
                 owned, covered, outcomes, lines
             )
@@ -177,6 +184,7 @@ def _forms(
                     invalid=invalid,
                     errors=errors,
                     incomplete=incomplete,
+                    ordinal=ordinal,
                 )
             )
         return forms
@@ -383,7 +391,10 @@ def mutate_file(
     covered = _coverage_map(found, covered_lines, ignore_coverage)
     _warn_uncovered(file_key, found, covered_lines, ignore_coverage)
     history = load_history(root, file_key)
-    digests = form_digests(source, path, root)
+    digests: dict = dict(form_digests(source, path, root))
+    if language in _VERSIONED_LANGUAGES:
+        for ns, fid, _s, _e, _nm, _pr, dg, ordinal in form_declarations(source, path, root):
+            digests[(ns, fid, ordinal)] = dg
     selected = _select(found, covered, history, digests, mutate_all, lines, language=language)
     outcomes = _carry_forward(found, covered, history, digests, language=language)
     _warn_many(file_key, selected, mutation_warning)
